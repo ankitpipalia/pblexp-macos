@@ -64,7 +64,7 @@ merge them.
 
 | ID | Host / date | Payload SHA | Image SHA | Observation |
 |---|---|---|---|---|
-| `W-PHASEC` | Windows `pblexp`, 2026-11-09 | original pblexp phase payload | `b1c123b8…3492` | full image served; `END_IMAGE_TX status=1` (historical rejection) |
+| `W-PHASEC` | Windows `pblexp`, 2026-11-09 | `da6cffd1…58b5b` (original pblexp segment1) | `b1c123b8…3492` | full image served; `END_IMAGE_TX status=1` (historical rejection) |
 | `M-SIG` | macOS native, 2026-11-10 | `9226f564…1b7d` or `2e7a9b2c…4b2d` | `a9fc1744…f214` | 181 READ_DATA64, `END_IMAGE_TX status=0`, `DONE_RESP status=1` |
 | `M-MOD-PF2` | macOS native, 2026-11-10 | `9226f564…1b7d` | `b1c123b8…3492` | 181 READ_DATA64, then USB reset before `END_IMAGE_TX`/`DONE` |
 | `M-MOD-LT2` | macOS native, 2026-11-10 | `2e7a9b2c…4b2d` | `b1c123b8…3492` | 181 READ_DATA64, then USB reset before `END_IMAGE_TX`/`DONE`; v2 stub was malformed |
@@ -78,7 +78,9 @@ for their own runs. The newer reset is not a new status-1 observation.
 ## 4. Oracle wire packet
 
 Host sequence: the normal fixed sequence through the 0xBF8 zero segment and
-175 resets, then segment2/3. Immediately after segment2/3 the device returned
+175 resets, then segment2/3. The zero response is
+`END_IMAGE_TX status=0x08` (`INVALID_DATA_SIZE`); it is the expected response
+to the deliberate 16-byte overrun, not an image-complete success. Immediately after segment2/3 the device returned
 48 bytes:
 
 ```text
@@ -97,7 +99,7 @@ authentication bypass.
 
 ## 5. Reproduction checks
 
-At public commit `326f2bc`, a fresh GitHub clone gives:
+At public commit `2808907`, a fresh GitHub clone gives:
 
 ```text
 python3 -m unittest discover -s tests -q

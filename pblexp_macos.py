@@ -202,7 +202,7 @@ def load_resources(directory: str, segment1_override: Optional[str] = None,
         expected_name = name
         if name == "segment1.bin" and segment1_hash:
             # Verify the resource-dir segment1 against a caller-provided hash
-            # (used by the patched auth-bypass resource directories).
+            # (used by custom/patched segment1 resource directories).
             path = os.path.join(directory, name)
             data = read_file(path)
             ok = len(data) == RESOURCE_SPECS[name][0] and sha256(data) == segment1_hash
@@ -220,7 +220,8 @@ def load_resources(directory: str, segment1_override: Optional[str] = None,
 
     zero = loaded["common_zero_segment.bin"]
     if len(zero) != ZERO_PBLEXP or any(zero):
-        raise SystemExit(f"{zero_path}: not the 0xBF8 all-zero pblexp resource")
+        raise SystemExit(f"{os.path.join(directory, 'common_zero_segment.bin')}: "
+                         "not the 0xBF8 all-zero pblexp resource")
 
     return Resources(
         directory=directory,

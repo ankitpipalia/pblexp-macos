@@ -23,7 +23,7 @@ oracle packet.
 | macOS 9008 enumeration, claim, bulk transport | working |
 | Native host sequence through segment3 | working |
 | Loader handoff + signed OEM programmer serve | working (181 READ_DATA64, DONE) |
-| Firehose configure and `<power value="reset_to_edl"/>` | working while a programmer runs |
+| Firehose configure and `<power value="reset_to_edl"/>` | working via the private `firehose_power.py` while a programmer runs |
 | Direct proof that the segment1 `0x970` payload executes | working (TX oracle after segment2/3) |
 | PBL programmer-auth bypass / modified programmer | **not working yet** |
 | Bootloader unlock, partition/GPT/RPMB write | **not attempted / not achieved** |

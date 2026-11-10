@@ -3,7 +3,8 @@
 Date: 2026-11-10. Scope: the 20 findings in the implementation/research
 review of commit `f31a9d3`. Corrections are host-side; verification is offline.
 No hardware discovery, USB probes, flashing, or storage commands form part
-of this review. Native host/serve success remains unvalidated.
+of this review. This is a historical snapshot: the live signed-programmer
+validation came later and is recorded in [VERIFICATION.md](VERIFICATION.md).
 
 | Review issue | Correction |
 |---|---|

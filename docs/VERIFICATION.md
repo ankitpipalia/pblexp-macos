@@ -57,11 +57,14 @@ The Windows RE packet-offset corrections are reflected in
 `WINDOWS-PBLEXP-RE.md`; the original shifted offsets are explicitly marked
 as prior annotations.
 
-## Remaining limits
+## Remaining limits (initial offline verification)
 
-- **Hardware behavior is unvalidated.** The native macOS host/serve sequence
-  has not completed a live run. The first 48-byte Hello710 bulk-OUT timeout
-  remains unexplained.
+These limits describe the state **before** the live runs recorded below.
+The live sections supersede the hardware-unvalidated statement.
+
+- **At the time of this offline verification, hardware behavior was
+  unvalidated.** The first 48-byte Hello710 bulk-OUT timeout remained
+  unexplained until the initial-HELLO drain fix.
 - The review’s P1 receive-buffering and aligned-ZLP issues occur later and
   do not explain the first-write timeout.
 - The signed-programmer Windows baseline and private payload hashes are
