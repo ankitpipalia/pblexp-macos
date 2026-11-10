@@ -65,9 +65,12 @@ conventions rather than preserving the endpoint descriptor; treat the
 number as unverified until a sanitized descriptor is attached. Runtime USB
 buffer sizing uses the actual endpoint descriptor.
 
-A complete native macOS host/serve run remains **unvalidated**. The recorded
-first 48-byte Hello710 bulk OUT timed out. Later resets sometimes failed,
-and warm `adb reboot edl` did not reliably clear the observed state. These
+A native macOS host sequence now completes through segment3 after the
+initial-HELLO drain fix. A complete host/serve run remains **unvalidated**:
+the loader reopen succeeds but no READ_DATA arrives after LOADER_HELLO. The
+historical first 48-byte Hello710 bulk OUT timeout was caused by the
+unsolicited initial HELLO not being drained on the libusb path; it is no
+longer reproduced on a cold EDL. These
 observations do not establish whether stale Sahara state, host transport,
 or other behavior caused the failure. Descriptor `iProduct` reads returned
 EIO while the device stayed enumerated; that does not establish that those

@@ -73,3 +73,25 @@ as prior annotations.
 Verdict: the hardening commit addresses the reviewed host-side defects and
 the public offline suite passes. It is suitable for another **cold-device**
 live test, not for an unlock claim.
+
+
+## Live native host validation (added after initial offline verification)
+
+A cold EDL run with the hardening changes plus an additional **initial-HELLO
+drain** completed the native host sequence on macOS:
+
+```text
+initial RX 0x30 B (drained before Hello710): 0100000030000000
+TX hello710 / elf_header / program_headers / segment1 -> READ_DATA64
+RX zero END_IMAGE_TX image=0xd status=0x8
+175 reset HELLOs
+segment2 + segment3
+handoff -> USB bus=1 address=2 ports=(1,)
+```
+
+This validates the native macOS host half through segment3. It does **not**
+validate the loader serve half: after handoff, the tool opened the new USB
+address but sent LOADER_HELLO and received no Sahara packet
+(`READ_DATA requests: 0`, read timeout). The loader-state transition remains
+open. The initial-drain change is the reason the first Hello710 OUT no longer
+times out; it was not part of the reviewed commit.

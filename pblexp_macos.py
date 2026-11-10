@@ -635,6 +635,14 @@ def send_steps(port: ByteTransport, steps: Sequence[HostStep],
             raise RuntimeError(message)
         log(f"WARN {message}")
 
+    # The macOS/libsub path sees the PBL's unsolicited HELLO (0x01/0x30)
+    # on the bulk IN endpoint.  The Windows COM path's driver/open consumed
+    # it.  Drain it before sending the host HELLO_RESP; otherwise the PBL's
+    # minimal USB stack can NAK the first OUT transfer.
+    if steps and steps[0].name == "hello710":
+        pre = port.drain(0.2)
+        if pre:
+            log(f"initial RX {len(pre):#x} B (drained before Hello710): {pre[:8].hex()}")
     for step in steps:
         for index in range(step.repeat):
             port.write(step.data)
@@ -789,6 +797,8 @@ def run_serve(args: argparse.Namespace, image_path: str,
         log(f"loader HELLO_RESP: {len(LOADER_HELLO):#x} B; xml={args.xml}")
         return 0
     port = open_transport(args)
+    if args.serve_settle:
+        time.sleep(args.serve_settle)
     result = ServeResult(opened_transport=port.description)
     buf = bytearray()
     deadline = time.monotonic() + args.total_timeout
@@ -1107,6 +1117,8 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--open-retry-delay", type=positive_seconds, default=0.5)
     p.add_argument("--handoff-delay", type=nonnegative_seconds, default=1.0,
                    help="delay after segment3 before handoff/serve")
+    p.add_argument("--serve-settle", type=nonnegative_seconds, default=0.5,
+                   help="settle delay after the loader-port open before HELLO")
     p.add_argument("--zero-len", type=lambda s: int(s, 0), default=ZERO_PBLEXP,
                    choices=ZERO_CHOICES)
     p.add_argument("--reset-count", type=bounded_count, default=175)
