@@ -48,7 +48,8 @@ provenance only.
 | `segment1_oracle.bin` | `299eaec923f255e38ce4aae309a3050265f21faf3daf69c051cd1e62ebbd9ef3` |
 | `devprg_710` (signed OEM) | `a9fc1744e2ba010b827a8b019aede426c2a72cc264678b91ae23b82679c6f214` |
 | `devprg_710_mod.bin` (one byte) | `b1c123b835a88542e4283265c716a31ecc8e71547a575414153f1b8bff473492` |
-| `devprg_710_mod_hashfix.bin` (table entry 21 replaced) | `a1e1510e53cf061acf101abd8fdf5732812230a189196087445ff1afb0bff10e` |
+| `devprg_710_mod_hashfix.bin` (outer table entry 21 replaced) | `a1e1510e53cf061acf101abd8fdf5732812230a189196087445ff1afb0bff10e` |
+| `devprg_710_mod_hashfix2.bin` (inner [5] + outer [21] replaced) | `3845f397055341d6b7a98f018f2884ae7980400f7febcdb5439a0b1abc81398f` |
 
 The v1/v2 loader-table payloads are historical failures: v1 called the
 wrong stub address; v2 fixed the call but stored the success constant as a
@@ -57,13 +58,20 @@ raw instruction word (`UDF`) instead of `movz/movk/ret`. v3 writes valid
 the table it patches (`0x14811620/58/60/68`) has zero references in the
 PBL and is all-zero in live IMEM, so v3 (and v4–v6) are inert.
 
-The host-side hash fix replaces the 32-byte table entry at file `0x12c8`
-(entry 21, phdr[21]) with the modified segment's SHA-256.  The 22-entry
-table starts at file `0x1028`; entry 0 is the ELF-header hash, entry 1 is
-zero for the hash segment itself, and the verifier skips zero entries, so
-the table is not self-checked.  The RSA-signature verifier sits behind a
-dead PKI gate.  The hash-fixed image is built and verified offline, not
-tested on hardware.
+The host-side hash fix has two levels.  The outer 22-entry table starts at
+file `0x1028`; entry 0 is the ELF-header hash, entry 1 is zero for the hash
+segment itself, and the verifier skips zero entries, so the outer table is not
+self-checked.  Entry 21 at file `0x12c8` covers phdr[21].
+
+phdr[21] is itself an ELF64 image (a Qualcomm QTI-signed XBL_SEC component)
+with its own 6-entry hash table at embedded `0x1b8`; entry [5] covers the
+segment containing the modified byte.  The double fix
+(`devprg_710_mod_hashfix2.bin`) patches inner entry [5] at file `0x971d4` and
+then the outer entry 21 at `0x12c8`; the outer-only control
+(`devprg_710_mod_hashfix.bin`) patches only the outer entry.  The outer
+RSA-signature verifier sits behind a dead PKI gate; the inner XBL_SEC QTI
+signature is not re-signed, and whether its verifier runs is unknown.  Both
+images are built and verified offline, not tested on hardware.
 
 ---
 

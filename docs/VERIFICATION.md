@@ -163,6 +163,8 @@ writes valid instruction words, but the table it patches
 live IMEM, so v3–v6 are inert.  Modified `devprg_710_mod.bin` still serves
 all 181 READ_DATA64 requests (`0xa850c` bytes), then resets before
 END_IMAGE_TX/DONE; auth bypass and unlock remain unproven.  skip-BC4C is
-withdrawn as hazardous.  The current candidate is a host-side fix of the
-programmer's 22-entry hash table (entry 21 at file `0x12c8`); it is
-offline-verified only, not tested on hardware.
+withdrawn as hazardous.  The current candidate is a host-side double fix of
+the programmer's nested hash tables: the outer 22-entry table (entry 21 at
+file `0x12c8`) and the embedded XBL_SEC's 6-entry table (entry [5] at file
+`0x971d4`).  The outer-only file is the control.  Both are offline-verified
+only, not tested on hardware.

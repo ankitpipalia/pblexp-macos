@@ -150,16 +150,32 @@ auth bypass, or unlock is proven.  The served image is not proof of
 acceptance: the normal signed control also serves 181 requests and then
 gets `END_IMAGE_TX status 0` and `DONE_RESP 1`.
 
-The preferred next test is host-side: the programmer carries a 22-entry
-SHA-256 table at file `0x1028` (entry 0 = ELF-header hash, entry 1 = zero
-for the hash segment itself, entries 2..21 = segment digests).  Entry 21
+The preferred next test is host-side.  The programmer carries an outer
+22-entry SHA-256 table at file `0x1028` (entry 0 = ELF-header hash, entry 1 =
+zero for the hash segment itself, entries 2..21 = segment digests).  Entry 21
 at file `0x12c8` is the SHA-256 of the programmer executable segment
-(`p_filesz` exactly); replacing it with the modified segment's digest
-(`fe58739b…112f`) yields `devprg_710_mod_hashfix.bin`
-(`a1e1510e…f10e`), served with the stock segment1.  The table is not
-self-checked and the RSA-signature verifier sits behind a dead PKI gate,
-so the hash is effectively unsigned in this path.  This is built and
-verified offline, **not yet tested on hardware**.
+(`p_filesz` exactly).
+
+There is a second, nested table: phdr[21] is itself an ELF64 image (a
+Qualcomm QTI-signed XBL_SEC component) with its own 6-entry hash table at
+embedded `0x1b8`.  The one-byte modification is inside that embedded image's
+phdr[5], so inner entry [5] is stale too.
+
+Two host-side candidates are built and verified offline:
+
+- `devprg_710_mod_hashfix2.bin` (`3845f397…398f`), the **double fix**:
+  patches inner entry [5] at file `0x971d4` to `6ac567e4…22d9`, then
+  recomputes the outer phdr[21] digest and patches outer entry 21 at
+  `0x12c8` to `df94797b…38a1`;
+- `devprg_710_mod_hashfix.bin` (`a1e1510e…f10e`), the **outer-only control**:
+  patches only outer entry 21 to `fe58739b…112f`; inner entry [5] stays
+  clean.
+
+Both use the stock segment1.  The outer table is not self-checked and the
+outer RSA-signature verifier sits behind a dead PKI gate, so the outer hash is
+effectively unsigned in this path.  The inner XBL_SEC is QTI-signed; the
+double fix satisfies its hash table but not its signature, and whether its
+verifier runs is unknown.  Neither candidate has been tested on hardware.
 
 A skip-BC4C candidate was built but is withdrawn: it zeroes
 `0x1480fbb0+0xb8`, a fuse-derived secure-mode bit; that skips `0x31117c`
