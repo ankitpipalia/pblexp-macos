@@ -48,12 +48,22 @@ provenance only.
 | `segment1_oracle.bin` | `299eaec923f255e38ce4aae309a3050265f21faf3daf69c051cd1e62ebbd9ef3` |
 | `devprg_710` (signed OEM) | `a9fc1744e2ba010b827a8b019aede426c2a72cc264678b91ae23b82679c6f214` |
 | `devprg_710_mod.bin` (one byte) | `b1c123b835a88542e4283265c716a31ecc8e71547a575414153f1b8bff473492` |
+| `devprg_710_mod_hashfix.bin` (table entry 21 replaced) | `a1e1510e53cf061acf101abd8fdf5732812230a189196087445ff1afb0bff10e` |
 
-The v1/v2 loader-table payloads are historical failures: v1 called
-`0x300b90` instead of the segment-relative `0x85e28b90`; v2 fixed the call but
-stored the success constant as a raw instruction word (`UDF`) instead of
-`movz/movk/ret`. v3 writes valid `5291fe00 72a5d900 d65f03c0` and
-`52875400 72ab53a0 d65f03c0` stubs. v3 is untested.
+The v1/v2 loader-table payloads are historical failures: v1 called the
+wrong stub address; v2 fixed the call but stored the success constant as a
+raw instruction word (`UDF`) instead of `movz/movk/ret`. v3 writes valid
+`5291fe00 72a5d900 d65f03c0` and `52875400 72ab53a0 d65f03c0` stubs, but
+the table it patches (`0x14811620/58/60/68`) has zero references in the
+PBL and is all-zero in live IMEM, so v3 (and v4–v6) are inert.
+
+The host-side hash fix replaces the 32-byte table entry at file `0x12c8`
+(entry 21, phdr[21]) with the modified segment's SHA-256.  The 22-entry
+table starts at file `0x1028`; entry 0 is the ELF-header hash, entry 1 is
+zero for the hash segment itself, and the verifier skips zero entries, so
+the table is not self-checked.  The RSA-signature verifier sits behind a
+dead PKI gate.  The hash-fixed image is built and verified offline, not
+tested on hardware.
 
 ---
 
@@ -126,6 +136,8 @@ compatibility, loader handoff, programmer execution, or auth bypass.
 - No raw pcap for the oracle run; the 48-byte response and host sequence are
   recorded above. A future run should capture USB traffic with `usbmon` or an
   equivalent.
-- v3 loader-table and skip-BC4C are built but untested.
+- v3–v6 loader-table payloads are inert (the table is dead code);
+  skip-BC4C is withdrawn as hazardous; the host-side hash fix is
+  offline-verified but untested on hardware.
 - The C.01 restore XML is geometry-verified but not end-to-end tested.
 - No partition/GPT/RPMB/devinfo write has been made.

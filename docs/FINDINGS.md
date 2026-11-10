@@ -128,17 +128,20 @@ signed-programmer control.
 ### Auth candidates (2026-11-10)
 
 The earlier postflags and loader-table payloads contained a stub-call bug:
-they called `0x300b90` instead of the segment-relative `0x85e28b90`
-(the segment is loaded at `0x85e28000`, not `0x300000`).  They were rebuilt
-with a PC-relative `bl #0x84` from `0xb0c` to `0xb90`.  A signed
-`devprg_710` control loads with the corrected postflags payload.
+they called `0x300b90` instead of the segment-relative stub.  The segment1
+image's ELF VA is `0x85e28000`, but its first instructions are a trampoline
+that copies the phase payload to `0x149ff000` and branches there; payload
+offset X runs at `0x149ff000 + (X - 0x970)`.  The stub call is PC-relative
+(`bl 0xb90`), so it lands at `0x149ff720`; the earlier absolute-target
+assumption was wrong.
 
 The first corrected loader-table payload still had a second bug: its
 resident "success stub" stored `0x2ec88ff0` directly as an instruction
-word, which decodes as `UDF`, not `movz/movk/ret`.  A v3 payload writes
-the valid three-word stubs (`5291fe00 72a5d900 d65f03c0` and
-`52875400 72ab53a0 d65f03c0`) and is the first corrected table test.  It
-is not yet tested on hardware.
+word, which decodes as `UDF`, not `movz/movk/ret`.  v3 writes the valid
+three-word stubs, but the table it patches (`0x14811620/58/60/68`) has
+**zero references** in the PBL and is all-zero in live IMEM, so v3 (and
+v4–v6) cannot affect rejection.  The table is dead code; this route is
+closed.
 
 The modified `devprg_710_mod.bin` (one benign string byte changed) still
 serves all 181 READ_DATA64 requests (`0xa850c` bytes), then the device
@@ -147,10 +150,26 @@ auth bypass, or unlock is proven.  The served image is not proof of
 acceptance: the normal signed control also serves 181 requests and then
 gets `END_IMAGE_TX status 0` and `DONE_RESP 1`.
 
-A skip-BC4C candidate is built but **not tested**: it zeroes the
-`0x1480fbb0+0xb8` flag before `FUN_0030b3b0`, then sets the finalize flags
-and calls `FUN_0030de40` again.  Its signed control and modified test remain
-the next hardware step.
+The preferred next test is host-side: the programmer carries a 22-entry
+SHA-256 table at file `0x1028` (entry 0 = ELF-header hash, entry 1 = zero
+for the hash segment itself, entries 2..21 = segment digests).  Entry 21
+at file `0x12c8` is the SHA-256 of the programmer executable segment
+(`p_filesz` exactly); replacing it with the modified segment's digest
+(`fe58739b…112f`) yields `devprg_710_mod_hashfix.bin`
+(`a1e1510e…f10e`), served with the stock segment1.  The table is not
+self-checked and the RSA-signature verifier sits behind a dead PKI gate,
+so the hash is effectively unsigned in this path.  This is built and
+verified offline, **not yet tested on hardware**.
+
+A skip-BC4C candidate was built but is withdrawn: it zeroes
+`0x1480fbb0+0xb8`, a fuse-derived secure-mode bit; that skips `0x31117c`
+secure setup, and if `ctx+0x40` is zero the later `0xe58c` asserts/hangs.
+It is not a safe fallback.
+
+The RAM-only fallback is postflags v4: call the real `0x30b3b0`, set byte
+`0x1480c378 = 1` (the DE40 success lever; `0x379`/`0x51` are the abort
+bytes), then call `0x30de40` again.  It is relocation-safe because it uses
+relative `ret` and absolute PBL/IMEM addresses.  It is built but untested.
 
 ### Firehose reset_to_edl
 
@@ -176,14 +195,15 @@ not be merged:
 malformed (`UDF`), so it is not a valid table-patch result. The full
 experiment table is in [EVIDENCE.md](EVIDENCE.md).
 
-Private firmware analysis recorded status `1` as the Sahara default at
-`0x308f34`, an early return in `FUN_0030DE40` when finalize flags are unset,
-and a separate programmer auth callback table registered by `FUN_0031117C`
-(`0x14811620`, `0x14811658/60/68`). The loader-table candidates are:
-v1 `f488ee50…3148` (wrong call target), v2 `2e7a9b2c…24b2d` (UDF constants),
-v3 `cc8f186c…8cb40b` (valid instructions, untested). These firmware-specific
-conclusions were not independently fact-checked without the firmware
-artifacts.
+Private firmware analysis recorded a status-1 return path near `0x308f34`
+(the exact emitter was not re-verified in the latest pass), an early return
+in `FUN_0030DE40` when finalize flags are unset, and a programmer auth
+callback table at `0x14811620`, `0x14811658/60/68` that is **never read** in
+this path (zero references; all-zero live IMEM). The loader-table
+candidates (v1 `f488ee50…3148` wrong call target, v2 `2e7a9b2c…24b2d` UDF
+constants, v3 `cc8f186c…8cb40b` valid instructions) are therefore inert.
+These firmware-specific conclusions were not independently fact-checked
+without the firmware artifacts.
 
 The historical C.01 boot-chain notes report no runtime
 `Is_VERIFIED_BOOT_2()` / GPT `vbmeta` lookup, continuing VB2 and Keymaster

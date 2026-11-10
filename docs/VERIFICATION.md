@@ -150,15 +150,19 @@ The payload called the PBL TX primitive `0x308b40`; no code-pattern scan.
 This is the first direct proof that the `0x970` slot executes on C.01 and
 that it runs after segment2/3.
 
-Corrected postflags and loader-table payloads used a PC-relative
-`bl #0x84` to the segment-relative stub at `0x85e28b90` instead of the
-earlier broken `0x300b90` call.  Signed `devprg_710` loads with the
-corrected postflags payload.
+Corrected postflags and loader-table payloads use a PC-relative `bl #0x84`
+to the stub at payload offset `0xb90`; the segment1 trampoline copies the
+payload to `0x149ff000` and branches there, so the stub runs at
+`0x149ff720`.  The earlier `0x85e28b90` absolute-target assumption was
+wrong.  Signed `devprg_710` loads with the corrected postflags payload.
 
 The first corrected loader-table stub was still malformed: it stored
-`0x2ec88ff0` as a raw instruction word (UDF), not `movz/movk/ret`.  A v3
-payload writes valid instruction words for both success stubs and is the
-first corrected table test; it is not yet tested.  Modified
-`devprg_710_mod.bin` still serves all 181 READ_DATA64 requests
-(`0xa850c` bytes), then resets before END_IMAGE_TX/DONE; auth bypass and
-unlock remain unproven.  A skip-BC4C candidate is built but untested.
+`0x2ec88ff0` as a raw instruction word (UDF), not `movz/movk/ret`.  v3
+writes valid instruction words, but the table it patches
+(`0x14811620/58/60/68`) has zero references in the PBL and is all-zero in
+live IMEM, so v3–v6 are inert.  Modified `devprg_710_mod.bin` still serves
+all 181 READ_DATA64 requests (`0xa850c` bytes), then resets before
+END_IMAGE_TX/DONE; auth bypass and unlock remain unproven.  skip-BC4C is
+withdrawn as hazardous.  The current candidate is a host-side fix of the
+programmer's 22-entry hash table (entry 21 at file `0x12c8`); it is
+offline-verified only, not tested on hardware.
