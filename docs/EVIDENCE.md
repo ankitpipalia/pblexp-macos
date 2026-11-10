@@ -97,7 +97,7 @@ authentication bypass.
 
 ## 5. Reproduction checks
 
-At public commit `bce8711`, a fresh local clone gives:
+At public commit `326f2bc`, a fresh GitHub clone gives:
 
 ```text
 python3 -m unittest discover -s tests -q
