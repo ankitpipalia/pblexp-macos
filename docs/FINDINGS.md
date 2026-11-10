@@ -101,6 +101,57 @@ programmer power reset still needs a physical power-on on this unit. The
 original descriptor research and its historical commands are preserved in
 [MACOS-USB-TRANSPORT.md](MACOS-USB-TRANSPORT.md).
 
+### Payload execution oracle (2026-11-10)
+
+A direct USB-TX oracle payload proved that the CVE payload at segment1
+offset `0x970` executes on the C.01 PBL.  The host sent the normal fixed
+sequence through the zero segment and 175 reset HELLOs, then segment2 and
+segment3.  Immediately after segment2/3 the device sent a 48-byte packet:
+
+```text
+PBLXORACLE2026!!EXEC-PROOF-0x9700123456789ABCDEF
+```
+
+The oracle payload called the PBL TX primitive at `0x308b40`; it did not
+scan for a code pattern.  This is the first direct proof of payload
+execution on this target, and it shows that the `0x970` slot runs **after**
+segment2/3, not at the zero-segment/END_IMAGE_TX point.  The earlier magic
+payloads used a code-pattern scan and did not produce this proof.
+
+The oracle also gives a repeatable way to test whether a candidate payload
+reached `0x970`: put a unique TX packet in the payload and look for it
+after segment2/3.  A candidate that is never reached looks identical to a
+signed-programmer control.
+
+### Auth candidates (2026-11-10)
+
+The earlier postflags and loader-table payloads contained a stub-call bug:
+they called `0x300b90` instead of the segment-relative `0x85e28b90`
+(the segment is loaded at `0x85e28000`, not `0x300000`).  They were rebuilt
+with a PC-relative `bl #0x84` from `0xb0c` to `0xb90`.  A signed
+`devprg_710` control loads with the corrected postflags and loader-table
+payloads.
+
+The modified `devprg_710_mod.bin` (one benign string byte changed) still
+serves all 181 READ_DATA64 requests (`0xa850c` bytes), then the device
+resets before `END_IMAGE_TX`/`DONE_RESP`; no modified-programmer execution,
+auth bypass, or unlock is proven.  The served image is not proof of
+acceptance: the normal signed control also serves 181 requests and then
+gets `END_IMAGE_TX status 0` and `DONE_RESP 1`.
+
+A skip-BC4C candidate is built but **not tested**: it zeroes the
+`0x1480fbb0+0xb8` flag before `FUN_0030b3b0`, then sets the finalize flags
+and calls `FUN_0030de40` again.  Its signed control and modified test remain
+the next hardware step.
+
+### Firehose reset_to_edl
+
+With the signed programmer running, `<data><power value="reset_to_edl"/>
+</data>` returned `<response value="ACK" .../>` and the phone re-enumerated
+as `05c6:9008`.  This provides a controlled EDL transition while a signed
+programmer is running.  It does not recover a PBL already wedged in
+`END_IMAGE_TX status 1`; that state still needs a power cycle.
+
 ## Separate auth and unlock research
 
 No unsigned or modified programmer execution and no bootloader unlock have

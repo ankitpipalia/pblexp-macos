@@ -131,3 +131,24 @@ Firehose transport end-to-end. It does **not** validate the auth-bypass
 payload or a modified programmer. The signed programmer is the control:
 a normal loader accepts it without the exploit patch. The loader-table
 candidate and `devprg_710_mod.bin` remain untested.
+
+## Payload execution proof (live, 2026-11-10)
+
+A direct-TX oracle payload at segment1 offset `0x970` proved execution:
+
+```text
+host: normal sequence through zero + 175 reset HELLOs + segment2/3
+device -> host, immediately after segment2/3:
+  PBLXORACLE2026!!EXEC-PROOF-0x9700123456789ABCDEF   (48 bytes)
+```
+
+The payload called the PBL TX primitive `0x308b40`; no code-pattern scan.
+This is the first direct proof that the `0x970` slot executes on C.01 and
+that it runs after segment2/3.
+
+Corrected postflags and loader-table payloads used a PC-relative
+`bl #0x84` to the segment-relative stub at `0x85e28b90` instead of the
+earlier broken `0x300b90` call.  Signed `devprg_710` loads with both.
+Modified `devprg_710_mod.bin` still serves all 181 READ_DATA64 requests
+(`0xa850c` bytes), then resets before END_IMAGE_TX/DONE; auth bypass and
+unlock remain unproven.  A skip-BC4C candidate is built but untested.
