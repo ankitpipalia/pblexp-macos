@@ -1,126 +1,110 @@
-# Findings — what works and what does not
+# Findings — evidence and current limits
 
-Status date: 2026-11-10. Device: owned Realme X RMX1901 (SDM710), C.01,
-bootloader locked. No partition/GPT/RPMB write was performed during this work.
+Status date: 2026-11-10. Target: owned Realme X RMX1901 (SDM710), C.01,
+bootloader locked. The implementation review and corrections used offline
+checks only: no hardware discovery, USB probes, or storage commands.
 
-## Working
+## Current port
 
-### Windows baseline (reference)
+The CLI implements host / serve / all / ping / check-resources / dry-run /
+self-test / list-ports. The `oppo710` sequence includes the `0xbf8` zero
+segment and 175 individual reset writes and HELLO reads, followed by the
+close / 1000 ms / reopen / loader-HELLO handoff recorded in the Windows RE.
+The serve path supports READ_DATA32/64, END_IMAGE_TX and DONE_RESP; the
+optional Firehose operation is a benign configure ping. No partition, GPT,
+RPMB, or `devinfo` write commands exist.
 
-- The original Windows `OPPOQcomPatchTool`/`pblexp` sequence loads the signed
-  OEM programmer `devprg_710` successfully.
-- Observed live:
-  - 175 reset HELLOs;
-  - the programmer is served fully (181 `READ_DATA64` requests, ~0xa850c bytes);
-  - `END_IMAGE_TX image=0xd status=0`;
-  - `DONE_RESP`;
-  - a benign Firehose `<configure>` gets a real programmer response.
-- Windows-tool RE is complete:
-  - UPX-packed PE32, NativeAOT;
-  - 11 embedded resources, all extracted and hashed;
-  - serial 115200 8N1, no handshake, DTR/RTS false;
-  - exact sequence and the close + 1000 ms + reopen + loader-HELLO handoff.
-  See [WINDOWS-PBLEXP-RE.md](WINDOWS-PBLEXP-RE.md).
+The reviewed host-side defects are addressed by buffered packet-sized USB
+reads, one shared USB backend, preflight resource/programmer validation,
+strict host-request checks, bounded serving ranges and discovery, identity
+preservation, and explicit completion status. See
+[IMPLEMENTATION-REVIEW.md](IMPLEMENTATION-REVIEW.md) for the issue mapping and
+verification commands. Public tests and `self-test` use synthetic fixtures;
+`check-resources` is a separate private integration check. Mocks cannot
+validate the native USB exchange or execution on the device.
+
+CDC setup requests are disabled by default. `--usb-cdc` is an experimental
+opt-in, not confirmed Windows compatibility. The recorded Windows COM port
+uses a Qualcomm vendor driver; no capture establishes its USB setup traffic.
+
+## Historical hardware observations
+
+These are retained research records. The private binaries and sanitized raw
+Windows logs needed to reproduce them are absent from the public checkout;
+the implementation review did not independently verify them.
+
+### Windows baseline
+
+The recorded original OPPOQcomPatchTool / `pblexp` run loaded signed OEM
+`devprg_710`: 175 reset HELLOs, 181 READ_DATA64 requests (~`0xa850c` bytes),
+END_IMAGE_TX image `0xd` status `0`, DONE_RESP, and a Firehose configure
+response. The recorded static analysis found a UPX-packed PE32 NativeAOT
+artifact, 11 embedded resources, serial 115200 8N1 with no handshake or
+DTR/RTS setters, and the explicit close / sleep / reopen handoff.
+
+The actual HELLO bytes were not recovered from the static artifact; the
+port uses captured values. Some packet-offset interpretations and the
+original inference about DONE were corrected after review. See
+[WINDOWS-PBLEXP-RE.md](WINDOWS-PBLEXP-RE.md).
+
+A successful signed-programmer transfer alone does **not** demonstrate an
+authentication bypass: normal Sahara loaders also load signed programmers.
+A same-image cold-device control without the exploit phase is needed to
+attribute any effect to the patch sequence.
 
 ### Native macOS transport
 
-- QDLoader 9008 enumerates on macOS as `05c6:9008`, vendor-specific interface,
-  bulk IN 0x81 / OUT 0x01, max packet 512.
-- No `/dev/cu.*` or tty node exists; Apple CDC ACM cannot bind class 0xFF.
-- `usb_edl.UsbEdl` finds, opens, claims, and releases the interface through
-  pyusb/libusb without root, kext, or usbfluxd.
-- Descriptor enumeration is confirmed live; qdl independently sees the same
-  `05c6:9008`.
-- Offline tests pass:
-  - `self-test` (in-memory transport, 175 individual reset writes/reads,
-    packet parsing, serving);
-  - `check-resources` (pristine and custom segment1 hashes);
-  - `dry-run host/all/serve`;
-  - `list-ports` reports both usb_edl and qdl.
+The historical record reports `05c6:9008`, a vendor-specific interface,
+bulk IN `0x81` / OUT `0x01`, successful open/claim/release through
+PyUSB/libusb without root, and independent `qdl` enumeration. No tty was
+created by stock macOS. Apple's ACM matching is class/subclass `2/2`;
+Linux `qcserial` can create a vendor `ttyUSB` port instead of CDC ACM.
 
-### Port implementation
+The earlier transport report inferred maxpacket 512 from high-speed bulk
+conventions rather than preserving the endpoint descriptor; treat the
+number as unverified until a sanitized descriptor is attached. Runtime USB
+buffer sizing uses the actual endpoint descriptor.
 
-- Native CLI with host / serve / all / ping / check-resources / dry-run /
-  self-test / list-ports.
-- Sequence preserved from the Windows tool, including 0xbf8 zero segment and
-  175 *individual* 0x13 writes with a 0x30 HELLO read after each.
-- Loader serve handles `READ_DATA32/64`, `END_IMAGE_TX`, `DONE`, and a benign
-  Firehose configure.
-- Custom experimental segment1 is supported with an explicit SHA-256.
-- No storage-write commands exist in the tool.
+A complete native macOS host/serve run remains **unvalidated**. The recorded
+first 48-byte Hello710 bulk OUT timed out. Later resets sometimes failed,
+and warm `adb reboot edl` did not reliably clear the observed state. These
+observations do not establish whether stale Sahara state, host transport,
+or other behavior caused the failure. Descriptor `iProduct` reads returned
+EIO while the device stayed enumerated; that does not establish that those
+reads caused the later state. The 8-byte receive-buffer defect and aligned
+OUT ZLP defect do not explain that first 48-byte write timeout.
 
-## Not working / open
+Re-enumeration and handle replacement across Sahara / loader / Firehose are
+implemented for offline testing but remain unvalidated on this hardware.
+The original descriptor research and its historical commands are preserved
+in [MACOS-USB-TRANSPORT.md](MACOS-USB-TRANSPORT.md).
 
-### Live native host sequence
+## Separate auth and unlock research
 
-- A live `host`/`all` run on macOS has **not** completed. The first Hello710
-  bulk OUT transfer times out.
-- The device was repeatedly left in a Sahara error state by earlier failed
-  runs. `qdl reset` sometimes acknowledged, then later returned
-  `SAHARA: no reset response from device`; a warm `adb reboot edl` did not
-  clear it reliably.
-- Because the PBL is wedged, these timeouts do not yet distinguish:
-  - a stale PBL/Sahara state;
-  - a libusb OPEN/claim/transfer issue;
-  - a missing Windows-driver class request.
-- Current mitigations already in the port:
-  - no `Device.describe()` (fixed);
-  - no `set_configuration()` reset;
-  - no descriptor-string reads by default;
-  - endpoint clear-halt and 0.5 s settle after claim;
-  - CDC line-coding/control-line-state requests mirrored from usbser.
-- The next diagnostic is a minimal C/libusb Hello probe on a cold EDL, then a
-  cold `all` run without any prior descriptor probe.
+No unsigned or modified programmer execution and no bootloader unlock have
+been demonstrated. The recorded modified programmer was rejected with
+END_IMAGE_TX image `0xd` status `1`.
 
-### USB re-enumeration/handoff
+Private firmware analysis recorded status `1` as the Sahara default at
+`0x308f34`, an early return in `FUN_0030DE40` when finalize flags are unset,
+and a separate programmer auth callback table registered by `FUN_0031117C`
+(`0x14811620`, `0x14811658/60/68`). The loader-table patch candidate
+(`segment1_loader_table.bin`, SHA-256 `f488ee50…3148`) remains unvalidated.
+These firmware-specific conclusions were not independently fact-checked
+without the firmware artifacts.
 
-- The native `all` path closes, sleeps, reopens, sends the loader HELLO, and
-  serves the programmer, but this has not been observed live on macOS.
-- USB handle invalidation across Sahara -> loader/Firehose is untested.
+The historical C.01 boot-chain notes report no runtime
+`Is_VERIFIED_BOOT_2()` / GPT `vbmeta` lookup, continuing VB2 and Keymaster
+milestone behavior, milestone-independent `VBRwDeviceState` in ABL/DXE with
+TA policy untested, and a separate pre-USB fastboot token gate at `0x311b4`.
+Those are separate research findings, not evidence that this port unlocks a
+device or that a transport fix bypasses secure boot. Nothing was flashed.
 
-### PBL programmer auth bypass
+## Evidence still needed
 
-- The signed programmer loads; a modified programmer is rejected with
-  `END_IMAGE_TX image=0xd status=1`.
-- Static RE found:
-  - status 1 is the Sahara state-machine default at `0x308F34`;
-  - the actual early return is in `FUN_0030DE40` when the finalize flags are
-    unset;
-  - the programmer loader has a separate auth callback table registered by
-    `FUN_0031117C` (`0x14811620`, `0x14811658/60/68`).
-- Best untested candidate: patch that table after registration, before
-  `FUN_0030E58C`, with stubs returning `0x2EC88FF0` / `0x5A9D3AA0`
-  (`segment1_loader_table.bin`, SHA `f488ee50…3148`).
-- No unsigned/modified programmer has executed.
-
-### Bootloader unlock
-
-- **No unlock was achieved.** Device state remains locked.
-- The ABL NO_AVB/Keymaster route is closed for C.01:
-  - no runtime `Is_VERIFIED_BOOT_2()`/GPT `vbmeta` lookup;
-  - VB2 still runs and sends the Keymaster milestone;
-  - `VBRwDeviceState` is milestone-independent in ABL/DXE, but TA policy is
-    untested;
-  - the pre-USB fastboot token gate (`0x311B4`) is independent of RPMB/devinfo
-    state.
-- Boot-chain design notes are separate from this port; nothing was flashed.
-
-## Evidence and reproducibility
-
-- Windows signed baseline: 181 READ_DATA, END_IMAGE_TX status 0, DONE_RESP,
-  Firehose configure response.
-- Native macOS detection: `05c6:9008`, bulk 0x81/0x01, maxpacket 512; qdl list
-  agrees.
-- The device serial is intentionally omitted from this public document.
-- The Windows-tool resource hashes and sequence are in
-  [WINDOWS-PBLEXP-RE.md](WINDOWS-PBLEXP-RE.md); macOS transport evidence is in
-  [MACOS-USB-TRANSPORT.md](MACOS-USB-TRANSPORT.md).
-
-## Next steps
-
-1. Cold power-off (not warm `adb reboot edl`) and run a minimal C/libusb
-   Hello test, then the native `all` sequence with no descriptor probes.
-2. If live host/serve works, test the loader-table auth candidate with the
-   modified programmer.
-3. If the table patch passes, move to the separate boot-chain/RPMB work; keep
-   stock XBL and use a host-loaded modified XBL or a RAM-only hook.
+Preserve sanitized endpoint descriptors, the relevant Windows USB/setup
+trace, and complete cold-device native logs to investigate the unresolved
+first-write timeout and handoff. Preserve a same-signed-image control
+without the patch sequence before claiming an auth effect. No such hardware
+validation was performed as part of these corrections; offline success
+must not be reported as live success.

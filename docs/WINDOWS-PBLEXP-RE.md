@@ -4,8 +4,15 @@ Date: 2026-11-10
 Scope: static reverse engineering of the shipped Windows tool. **No device was contacted, no
 serial port was opened, and the original artifact was never modified.** All work was done on
 copies in `/tmp`.
-Companion data: [`resources/RESOURCES-WINDOWS.json`](resources/RESOURCES-WINDOWS.json),
-extracted resource files in [`resources/`](resources/), and this report.
+Companion data originally lived in `resources/RESOURCES-WINDOWS.json` and
+extracted private resource files; those artifacts are not included in this public checkout.
+
+**Review correction (2026-11-10):** This is an archival static-analysis record, not
+a fresh independent reproduction. Resource hashes and disassembly claims require the
+original binaries to verify. The HELLO payload bytes were not recovered statically.
+Wire offsets and the DONE inference in §5.4–5.5 are corrected below; historical Python
+comparisons in §8 describe predecessor scripts, not the current native CLI. Current
+behavior and offline checks are in [IMPLEMENTATION-REVIEW.md](IMPLEMENTATION-REVIEW.md).
 
 ---
 
@@ -230,10 +237,10 @@ read therefore raises `TimeoutException` and aborts the run. Writes go through
 `port.BaseStream.Write(byte[], 0, byte[].Length)` (`0x403d38`), so **the write timeout governs
 the whole transfer**.
 
-Practical consequence for macOS: the Windows tool never asserts DTR/RTS. Many USB-serial/EDL
-setups require DTR assertion to keep the port open; the port should make DTR/RTS explicit
-(pyserial `dsrdtr=False`, `rtscts=False`, `dtr=True/rts=True` as a fallback) rather than rely on
-the Windows defaults.
+The artifact shows no DTR/RTS setters. That says nothing about the Qualcomm vendor
+driver's USB control traffic. Native macOS bulk USB has no tty modem-control layer;
+the current port sends no CDC setup requests by default. `--usb-cdc` is an experimental
+opt-in pending a Windows USB capture, not established `usbser.sys` compatibility.
 
 ---
 
@@ -337,12 +344,16 @@ options: 0)` and then loops:
 
 * `pkt = ReadPacket(port)`
 * `cmd = u32 at pkt[0]`, `len = u32 at pkt[4]` (total length including the 8-byte header)
-* **`cmd == 0x04` (`END_IMAGE_TX`)**: requires `len >= 0x10`; reads `status = u32 at pkt[0x14]`
+* **`cmd == 0x04` (`END_IMAGE_TX`)**: standard wire length is `0x10`; image is
+  u32 at byte `+0x08`, status u32 at byte `+0x0c`. The prior `pkt[0x14]`
+  annotation was not a valid wire offset.
   * `status != 0` → builds `"ImageTxStatus:" + status` and reports failure (`0x403952`)
   * `status == 0` → writes `Packets[+0x0c]` (**0x10 bytes**), does one more `ReadPacket`,
     prints, and returns (`0x40384c..0x40386d`)
-* **`cmd == 0x12` (`READ_DATA64`)**: requires `len >= 0x28`; parses
-  `offset = u64 at pkt[0x18]` and `length = u64 at pkt[0x20]`; validates the request against the
+* **`cmd == 0x12` (`READ_DATA64`)**: standard wire length is `0x20`; image is
+  u64 at byte `+0x08`, offset u64 at `+0x10`, size u64 at `+0x18`. The prior
+  `len >= 0x28`, `+0x18` / `+0x20` annotations were shifted by eight bytes
+  relative to the wire. The recorded implementation validates the request against the
   stream, repositions the file, reads `length` bytes and **writes them to the port with no
   additional header** (`0x40378b..0x4037d4`). The loop then continues.
 * **anything else** → prints `收到意外的 Sahara 命令: <cmd>` and aborts (`0x403b77`).
@@ -359,20 +370,29 @@ buf = new byte[len]; copy header; if len > 8 read exactly len-8 more
 `ReadExactly` (`0x403e80`) loops on `SerialPort.Read` until `n` bytes are collected; the 10 s
 `ReadTimeout` applies per underlying read.
 
-### 5.5 What is *not* there: DONE / Firehose
+### 5.5 DONE and Firehose: limits of the static evidence
 
-The task brief mentions "DONE/firehose"; the artifact deliberately does **not** implement either:
+The absence of an incoming `0x05` DONE handler does **not** establish that this host
+sends no DONE: hosts send DONE and receive DONE_RESP. Standard DONE is an 8-byte
+host packet; DONE_RESP is 12 bytes with u32 status at byte `+0x08` (`0` pending,
+`1` complete). See [qdl's Sahara implementation](https://github.com/linux-msm/qdl/blob/master/src/sahara.c).
 
-* There is **no `0x05` DONE handler** in the serve loop — the only handled commands are
-  `0x04` (`END_IMAGE_TX`) and `0x12` (`READ_DATA64`); everything else hits the
-  `收到意外的 Sahara 命令` abort.
-* There is **no Firehose XML anywhere in the image**: byte scans for `<?xml`, `<data`,
-  `<response`, `configure`, `firehose`, `program`, `erase` find nothing in `.text`/`.rdata`
-  (the only `<?xml` is the RT_MANIFEST in `.rsrc`).
+The recorded post-END_IMAGE success path writes `Packets[+0x0c]`, annotated as
+`0x10` bytes, then reads another packet. That annotation alone cannot identify the
+payload as standard DONE. Re-examine its actual bytes, managed-array lengths, and
+a sanitized Windows capture before claiming whether it sends DONE or uses a quirk.
+The earlier conclusion that the artifact deliberately implements no DONE is withdrawn.
 
-So `pblexp` ends at "Sahara transfer of `-f` complete, `END_IMAGE_TX status==0`". Any Firehose
-traffic (partition read/write, `configure`, `program`) is produced by the uploaded programmer
-(`devprg_710`) and by whatever host drives it afterwards — not by this tool.
+The original analysis found no host Firehose XML literals in `.text` / `.rdata`
+(`<?xml`, `<data`, `<response`, `configure`, `firehose`, `program`, `erase`;
+the XML manifest was in `.rsrc`). This supports the narrower conclusion that no
+literal XML configure path was found; it does not reconstruct all runtime traffic.
+The current Python CLI separately implements an optional configure ping.
+
+**Offset interpretation:** the old END_IMAGE and READ_DATA64 annotations may have
+mixed a managed-array object's data offset with byte-array indexes. That is a
+hypothesis requiring the original binary, not a confirmed explanation. On-wire
+packet layouts above take precedence for the port.
 
 ---
 
@@ -454,7 +474,8 @@ Consequences:
    assumes one shared code path for 710/845 will mis-frame 845.
 5. **The tool is a full Sahara host**: it does not merely push a file; it parses
    `READ_DATA64`/`END_IMAGE_TX`, serves arbitrary offsets/lengths from the programmer file, and
-   reports `ImageTxStatus`. The current Python scripts stop before this stage.
+   reports `ImageTxStatus`. The predecessor scripts described in §8 stopped before this
+   stage; the current `pblexp_macos.py` implements serving and completion checks.
 6. **`--check-resource` exists** and validates all 11 embedded resources against expected sizes.
 7. **No DTR/RTS/handshake configuration at all** — the only serial setup is baud/parity/bits/
    stop/timeouts (§4).
@@ -464,10 +485,11 @@ Consequences:
 
 ---
 
-## 8. Differences from our Python host/loader scripts
+## 8. Historical comparison with predecessor Python scripts
 
-Compared against `work/pblexp-oppo710/pbl_host_magic.py`,
-`pbl_loader_probe.py`, `pbl_firehose_ping.py`.
+Archival comparison against `work/pblexp-oppo710/pbl_host_magic.py`,
+`pbl_loader_probe.py`, `pbl_firehose_ping.py`. These are not the current
+`pblexp_macos.py`; the gaps below describe that earlier state.
 
 | Aspect | `pblexp.exe` (artifact) | Our Python | Verdict |
 |---|---|---|---|
@@ -490,22 +512,23 @@ Python behaviour) for experimentation.
 
 ---
 
-## 9. macOS port checklist
+## 9. Original port checklist (archival)
 
-1. **Resources**: ship the 11 files from `resources/` (hashes in `RESOURCES-WINDOWS.json`);
-   `common_zero_segment` may be generated as `b"\0" * 0xbf8`.
-2. **Serial**: `termios` raw mode, `B115200`, `CS8`, `PARENB=0`, `CSTOPB=0`,
-   `CRTSCTS=0`, `IXON/IXOFF=0`; implement `ReadExactly(n, deadline=10 s)` on top of `poll()`.
-   Decide DTR/RTS explicitly (`ioctl(TIOCMBIS, TIOCM_DTR|TIOCM_RTS)` if the adapter needs it) —
-   the Windows tool never sets them.
+1. **Resources**: the Windows artifact embeds 11 resources, but this public `oppo710`
+   port needs only the subset listed in [../resources/README.md](../resources/README.md).
+   Do not redistribute private binaries. `common_zero_segment` may be generated as
+   `b"\0" * 0xbf8` and verified against its recorded hash.
+2. **Transport**: native macOS uses direct bulk USB with maxpacket-multiple receive
+   buffers and a retained logical-read queue. Preserve serial framing/settings only for
+   an actual serial backend. Windows serial constants do not imply native CDC requests.
 3. **Open/close/open**: implement the `Dispose → sleep 1000 ms → open` transition, and reset
    buffers on both opens.
 4. **Sequence engine**: table-driven, per SoC, with the exact write/read sizes from §5.2/§5.3.
    175 is a literal, not a heuristic.
 5. **Sahara host**: 8-byte header framing (`cmd`, `len`, max 0x1000), `READ_DATA64` file serve
    (offset/length 64-bit), `END_IMAGE_TX` status handling, `ImageTxStatus` reporting.
-6. **Modes**: `--check-resource` equivalent is cheap and useful as a smoke test (validate the 11
-   resource lengths/hashes at startup).
+6. **Modes**: `check-resources` checks the current port's private resource subset; public
+   `self-test` and unittest cases use synthetic fixtures without those resources.
 7. **Do not** try to synthesise the hello payloads from the EXE (§7.1).
 
 ---
@@ -536,8 +559,8 @@ Python behaviour) for experimentation.
   sizes / hashes / names, serial constants, write/read sizes and ordering, 175 loop, 1000 ms
   sleep + reopen, packet framing, `READ_DATA64`/`END_IMAGE_TX` handling, CLI literals.
 * **Inferred (medium)**: exact `SerialPort` property→setter mapping (from call order plus each
-  setter's validation constant); `READ_DATA64` field offsets beyond `offset`/`length`
-  (packet `+0x18`/`+0x20`); model→function mapping for `oppo665` (by elimination plus the
+  setter's validation constant); interpretation of managed-object accesses versus wire
+  offsets (see §5.4–5.5 corrections); model→function mapping for `oppo665` (by elimination plus the
   665-specific messages).
 * **Unknown**: the two 0x30-byte hello payload values (§7.1); whether the Windows host copy at
   `C:\...\pbl-host\pblexp.exe` matches the packed original's hash; whether `ReadExactly` retries

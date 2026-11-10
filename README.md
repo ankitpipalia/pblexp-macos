@@ -1,6 +1,6 @@
 # pblexp-macos
 
-A native **macOS/libsub** port of the Qualcomm Sahara/`pblexp` `oppo710`
+A native **macOS/libusb** port of the Qualcomm Sahara/`pblexp` `oppo710`
 workflow used on the Realme X (RMX1901, SDM710).
 
 This is a **research and porting project**, not a bootloader-unlock tool. It
@@ -22,12 +22,14 @@ interface**:
 
 ```text
 VID 0x05c6  PID 0x9008
-interface class/subclass/protocol 0xff/0xff/0xff (or 0x10/0x11/0x13)
+interface class/subclass 0xff/0xff; protocol 0xff, 0x10, 0x11, or 0x13
 two bulk endpoints (OUT + IN)
 ```
 
-macOS does **not** create a `/dev/cu.usbmodem*` or tty node for it, and the
-Apple CDC ACM driver only matches class 0x02. No kext, dext, or `usbfluxd` is
+Stock macOS did **not** create a `/dev/cu.usbmodem*` or tty node for the
+observed interface. Apple CDC ACM matches class/subclass `0x02/0x02`; a
+third-party vendor driver is a separate case. Linux `qcserial` can expose a
+vendor `ttyUSB` port, which is distinct from CDC ACM. No kext, dext, or `usbfluxd` is
 needed: pyusb/libusb talks to IOKit directly. See
 [docs/MACOS-USB-TRANSPORT.md](docs/MACOS-USB-TRANSPORT.md).
 
@@ -61,24 +63,32 @@ resources/oppo710_program_headers.bin
 resources/segment1.bin
 resources/segment2.bin
 resources/segment3.bin
-resources/common_zero_segment.bin
-resources/hello710.bin
+resources/common_zero_segment.bin  # optional: generated and hash-checked if absent
 ```
 
 Expected hashes and provenance are in [resources/README.md](resources/README.md).
 The signed programmer is supplied with `--image /path/to/devprg_710`.
 
-If a resource is missing, the tool refuses before touching the device.
+The 48-byte Hello710 is a constant in the code; `hello710.bin` is not loaded.
+Host resources are size/hash-checked before opening a transport. Programmer
+data is read and checked for nonempty content; its SHA-256 is logged, but the
+CLI does not independently verify its OEM signature. A custom `--segment1` requires its explicit `--segment1-hash`.
 
 ---
 
 ## Usage
 
 ```bash
-# offline checks (resources required)
+# public offline tests: synthetic fixtures, no payloads or hardware
+python3 -m unittest discover -s tests -v
 python3 pblexp_macos.py self-test
+
+# private resource integration / sequence inspection
 python3 pblexp_macos.py check-resources
-python3 pblexp_macos.py dry-run --mode all
+python3 pblexp_macos.py dry-run --mode all --image /path/to/devprg_710
+
+# ping dry-run needs no payload resources
+python3 pblexp_macos.py ping --dry-run
 
 # live: detect the 9008 interface
 python3 pblexp_macos.py list-ports
@@ -100,9 +110,30 @@ python3 pblexp_macos.py all --transport usb \
 The macOS default transport order is **USB first**, then serial. On Windows,
 use `--transport serial --port COMx`.
 
-Do not run descriptor probes (`list-ports`, `qdl list`) immediately before a
-live host run on this PBL; its minimal USB stack can be disturbed by string
-descriptor control transfers. `usb_edl` avoids them by default.
+USB device selection, including `--usb-bus` and `--usb-address`, uses the
+same `UsbEdl` backend; an explicit USB selector forces USB transport. Discovery
+polling uses `--port-timeout` and `--reopen-timeout`. USB reconnect retains the
+bus/physical port path while allowing its address to change. If the backend
+provides no port path, only the original bus/address is accepted. This selects
+a USB location, not an authenticated device identity. Ambiguous targets are
+rejected. Serial handoff reopens the original COM/path; automatic serial path
+changes are not supported. Individual OS USB calls have their own timeouts.
+
+CDC line-coding/control-line-state requests are disabled by default.
+`--usb-cdc` enables an experimental compatibility probe; the Windows tool uses
+a Qualcomm vendor driver, and its actual USB setup requests have not been
+captured. Descriptor string reads are also avoided by default. Historical
+`iProduct` reads returned EIO, but this does not show they caused later
+Sahara timeouts.
+
+For `serve`/`all`, exit `0` means completed Sahara when `--xml none`, or a
+programmer XML response when a ping is requested. Exit `2` means accepted
+image data but missing completion or the requested XML response; exit `3`
+means rejection or incomplete transfer. `ping` returns `0` for a response and
+`2` when no response arrives. Input, resource, or transport errors are reported
+as exit `1` (argument parsing errors use `2`). Sahara completion requires a valid `DONE_RESP` with status `1`;
+status `0` is pending. See [docs/IMPLEMENTATION-REVIEW.md](docs/IMPLEMENTATION-REVIEW.md)
+for the review corrections and remaining hardware limits.
 
 ---
 
@@ -112,7 +143,8 @@ descriptor control transfers. `usb_edl` avoids them by default.
 pblexp_macos.py                 native CLI
 usb_edl.py                      pyusb/libusb Qualcomm EDL transport
 resources/README.md             required resources and hashes (no blobs)
-docs/FINDINGS.md                what works / what does not
+docs/FINDINGS.md                historical evidence and current limits
+docs/IMPLEMENTATION-REVIEW.md   review corrections and public verification
 docs/MACOS-USB-TRANSPORT.md     macOS 9008 transport research
 docs/WINDOWS-PBLEXP-RE.md       static RE of the Windows OPPOQcomPatchTool
                                 sequence, resources, serial parameters

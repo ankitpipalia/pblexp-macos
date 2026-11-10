@@ -1,15 +1,26 @@
 # macOS native support for Qualcomm HS-USB QDLoader 9008 — serial research & pblexp port strategy
 
-**Status:** research complete, device verified live
+**Status:** archival descriptor research; full native host/serve exchange unvalidated
 **Date:** 2026-11-10
 **Target project:** RMX1901 (Realme X, SDM710) EDL / `pblexp` workflow
 **Author:** research subagent
+
+**Review correction (2026-11-10):** Historical commands and `[OBSERVED]` blocks below
+record the earlier descriptor-only investigation; they were not rerun during this
+implementation review. Current code and verification are described in
+[IMPLEMENTATION-REVIEW.md](IMPLEMENTATION-REVIEW.md). A vendor interface does not match
+stock Apple ACM (`2/2`), but this does not rule out a third-party vendor tty driver.
+Windows vendor-driver traffic has not been captured; CDC requests are disabled by
+default and require `--usb-cdc`. Descriptor EIO does not prove that descriptor reads
+caused later Sahara failures. Maxpacket 512 was inferred in this original report;
+a sanitized endpoint descriptor is still needed to establish the historical value.
+The running transport uses endpoint descriptors to size buffers.
 
 **Evidence labels used throughout**
 
 | Label | Meaning |
 |---|---|
-| `[OBSERVED]` | Measured on this exact Mac, in this session. Reproducible command included. |
+| `[OBSERVED]` | Recorded in the original device session; not independently rerun in this review. |
 | `[APPLE-PRIMARY]` | Read from Apple's own installed driver bundle / man page on this Mac. |
 | `[TOOL-SRC]` | Read from the tool's source code at a pinned commit. |
 | `[DOC]` | Vendor or third-party documentation / public writeup. |
@@ -26,14 +37,15 @@
 
 ## 0. TL;DR
 
-1. **QDLoader 9008 does *not* enumerate as `/dev/cu.usbmodem*` or `/dev/tty.usbmodem*` on macOS — and it never will.** It is a **vendor-specific USB interface (class `0xFF`, subclass `0xFF`, protocol `0x10`)**, not CDC ACM. It creates **no tty device of any kind**. `[OBSERVED]`
+1. **QDLoader 9008 does *not* enumerate as `/dev/cu.usbmodem*` or `/dev/tty.usbmodem*` on stock macOS for the observed interface.** It is a **vendor-specific USB interface (class `0xFF`, subclass `0xFF`, protocol `0x10`)**, not CDC ACM. No tty was observed with the stock drivers. `[OBSERVED]`
 2. **No driver, no kext, no usbfluxd, no system extension is needed.** Access is via **libusb → IOKit**, which requires **no `sudo`** and **no udev rules**. macOS is *simpler* than Linux here, because there is no `qcserial` to fight. `[OBSERVED]`
 3. **`usbfluxd` is irrelevant** — it is a subproject of `usbmuxd` for multiplexing **iOS** devices over a socket. It has nothing to do with Qualcomm EDL. Strike it. `[DOC]`
 4. **Best tool: `qdl` (linux-msm/qdl).** Already installed here as **v2.9.1**; officially ships **macOS arm64 binaries**; matches **VID `0x05c6` with PID deliberately unfiltered**. `[OBSERVED]` + `[TOOL-SRC]`
 5. **Detection:** `qdl list` is the correct primary command and works today →
-   `05c6:9008<TAB><serial>`. **`pyserial list_ports` and `ls /dev/cu.*` will never see it.**
+   `05c6:9008<TAB><serial>`. **`pyserial list_ports` and `ls /dev/cu.*` did not expose this interface on stock macOS.**
    The serial can degrade to `(none)` while the device stays enumerated — **key on
-   VID/PID + interface class, never on the serial, and do not poll.** `[OBSERVED]`
+   VID/PID + interface class plus physical bus/port identity. Current discovery uses
+   bounded retries without string reads; ambiguous matches fail.** `[OBSERVED]`
 6. **Port recommendation: go libusb-only and delete the COM-port abstraction** from the Windows `pblexp` workflow. DTR/RTS/baud/exclusive-open logic has no macOS equivalent to port — it has to be *replaced*, not translated.
 
 ---
@@ -160,7 +172,7 @@ device *is* bound on this same Mac right now (`AppleUSBNCMControl@0`, `AppleUSBN
 So the stack does bind CDC devices — it simply has no rule that matches `0xFF`.
 `[OBSERVED]`
 
-#### 1.4 Linux agrees — the same 9008 is deliberately *not* a serial port `[TOOL-SRC]`
+#### 1.4 Linux qcserial exposes a vendor serial port, not CDC ACM `[TOOL-SRC]`
 
 `drivers/usb/serial/qcserial.c` (torvalds/linux, master) lists the device:
 
@@ -209,7 +221,7 @@ talks to the device directly. This is the single most important framing point fo
 | `iProduct` | `QUSB_BULK_CID:0400_SN:<serial>` | `[OBSERVED]` |
 | `iSerialNumber` | **absent (0)** — serial is embedded in `iProduct` after `_SN:` | `[OBSERVED]` |
 | `bInterfaceClass/SubClass/Protocol` | `0xFF / 0xFF / 0x10` | `[OBSERVED]` |
-| Endpoints | 2 × bulk (IN + OUT), `wMaxPacketSize` 512 @ high speed | `[OBSERVED]`/`[INFERRED]` |
+| Endpoints | 2 × bulk (IN + OUT); maxpacket 512 inferred from high-speed defaults, not preserved in a descriptor capture | `[OBSERVED]` endpoint types / `[INFERRED]` maxpacket |
 | Line coding / baud | **none — not applicable** | see below |
 
 **"What baud rate?" has no answer for 9008.** There is no UART, no line coding, no
@@ -227,7 +239,8 @@ The Windows/Linux product-string convention is documented in qdl source:
 (`[TOOL-SRC]` `src/usb.c`)
 
 This is why `qdl list` prints `<serial>` even though there is no serial descriptor — and
-why `qdl -S <serial>` is the correct way to select this device.
+why `qdl -S <serial>` can select this device when the product string is available.
+The current port instead preserves physical identity without default string reads.
 
 #### 1.7 Verdict
 
@@ -501,14 +514,14 @@ ioreg -r -n "QUSB_BULK_CID:0400_SN:<serial>" -l -w0
 > Apple Silicon devices has been completely removed."* Code that enumerates `IOUSBDevice`
 > finds nothing on an M-series Mac.
 
-### 3.4 `pyserial list_ports` — **will never see it. Do not use as a detector.**
+### 3.4 `pyserial list_ports` — no stock-driver tty for the observed interface
 
 ```console
 $ python3 -c "import serial.tools.list_ports as lp; print([p.device for p in lp.comports()])"
 ['/dev/cu.debug-console', '/dev/cu.Bluetooth-Incoming-Port']
 ```
 
-This is not a bug and not fixable by configuration. pyserial's macOS backend starts from
+The observed stock-driver result follows from the absence of a serial binding. pyserial's macOS backend starts from
 `IOSerialBSDClient` services:
 
 ```python
@@ -528,8 +541,9 @@ VID/PID. This also means the `vid`/`pid` fields only exist *because* a serial dr
 bound. `[OBSERVED]` both visible ports report `vid=None, pid=None, hwid="n/a"`.
 
 **Consequence for `bkerler/edl`:** its `--serial` / `detectdevices()` path compares
-`port.pid`/`port.vid` against `default_ids[0x05c6,0x9008]`. On macOS that path can never
-match. `edl --serial` is a Windows/Linux-COM convenience only.
+`port.pid`/`port.vid` against `default_ids[0x05c6,0x9008]`. It cannot match the
+observed interface without a serial driver. Windows vendor COM and Linux qcserial
+provide such bindings; a third-party macOS vendor driver is a separate possibility.
 
 ### 3.5 IOKit from native code (Swift)
 
@@ -578,8 +592,8 @@ IORegistry key name — use the literal `"idVendor"`, as pyserial does).
 | `qdl list` | **yes** | descriptor-only handle | **primary gate** |
 | `system_profiler -json` | yes | no | UI/telemetry, stable `location_id` |
 | `ioreg` (`IOUSBHostDevice`) | yes | no | class verification, debugging |
-| `pyserial list_ports` | **never** | — | **do not use** |
-| `ls /dev/cu.*` | **never** | — | **do not use** |
+| `pyserial list_ports` | **no, with observed stock drivers** | — | use USB discovery |
+| `ls /dev/cu.*` | **no, with observed stock drivers** | — | use USB discovery |
 
 ---
 
@@ -602,18 +616,17 @@ talks to embedded hardware uses `cu.*`.
 and therefore **neither node exists**. If you ever add a *diag* path (`0x901D`) or a
 CDC-ACM device, use `cu.*` and set `CLOCAL`; never use `tty.*` for outbound.
 
-### 4.2 DTR / RTS — do not port this code
+### 4.2 DTR / RTS and unconfirmed CDC setup
 
-Windows `pblexp`/`fh_loader` may assert DTR/RTS as part of opening a COM handle. On macOS
-there is **no modem control layer** for a `0xFF` bulk interface:
-- There is no `TIOCMBIS`/`TIOCMSET` to call — no tty exists.
-- The device's `0xFF` interface does not implement CDC `SET_CONTROL_LINE_STATE` semantics.
-- Sending `libusb_control_transfer` with `SET_CONTROL_LINE_STATE` (0x22) to a 9008 is at
-  best ignored, at worst a stall/`LIBUSB_ERROR_PIPE` on a device that has no control
-  endpoint for it.
+The static Windows analysis found no DTR/RTS setters. A Qualcomm vendor COM
+driver can still issue USB requests internally; its actual setup traffic is unknown.
+The observed macOS `0xff` bulk interface has no tty modem-control layer. Its class
+descriptor does not establish whether it accepts CDC-style vendor compatibility
+requests, so neither support nor failure should be asserted without a trace.
 
-**Action:** delete DTR/RTS/break/line-coding code from the port. Keep it only behind the
-`#ifdef _WIN32` branch if the Windows build must still work.
+The current port sends no line-coding or control-line-state requests by default.
+`--usb-cdc` explicitly enables the experimental requests and reports errors. This
+is a probe of a hypothesis, not verified mirroring of Windows `usbser.sys` traffic.
 
 ### 4.3 Exclusive access — the real failure mode
 
@@ -659,9 +672,9 @@ can be torn down and re-created. Two consequences:
 1. **Any open `libusb_device_handle` can become stale.** The next bulk transfer returns
    `LIBUSB_ERROR_NO_DEVICE` (or `LIBUSB_ERROR_IO`). The device node is gone; the handle
    cannot be revived.
-2. **The `locationID` (physical port) is stable, the `sessionID` is not.** Re-find by
-   VID/interface class and re-claim — **never** cache a handle across the Sahara→Firehose
-   boundary, and never cache by index into a device list, which reorders.
+2. **Physical port identity is preferable to a changing device address/session.**
+   Preserve bus/port path and interface when reacquiring a device; reject ambiguity.
+   A hub topology change can invalidate that identity. Do not cache a list index.
 
 `qdl` solves this with a **250 ms rescan loop** rather than a fixed timeout:
 
@@ -672,11 +685,10 @@ usleep(250000);
 ```
 (`[TOOL-SRC]` `src/usb.c`)
 
-Recommended port behaviour: wrap every transfer in a
-`NO_DEVICE → close, rescan (≤250 ms cadence, overall deadline), re-claim, retry once`
-recovery, and surface a distinct "device re-enumerated" state to the UI rather than a
-generic error. Also expect the **PID to change** in some flows (`9008` ↔ `900E`); match on
-VID + interface class, not PID.
+Current port behavior handles disconnection at supported protocol transitions with
+close, bounded rediscovery of the same physical device, and re-claim. Do not replay
+an arbitrary failed payload: transfer completion can be ambiguous. Preserve explicit
+selectors and expected modes; `900E` crash-dump is not a successful EDL handoff.
 
 ### 4.7 The `900E` trap
 
@@ -711,7 +723,7 @@ re-enumeration behind a hub can move `locationID`, invalidating any port-keyed s
 Two devices in EDL on the same Mac are indistinguishable by serial when `iSerialNumber` is
 absent and product strings collide — **enforce one EDL device at a time**.
 
-### 4.10 String descriptors are unreliable — and do not poll the device
+### 4.10 String-descriptor EIO: observation and unknown cause
 
 `[OBSERVED]` The same attached device produced both of these, minutes apart, **without
 re-enumerating** (IORegistry object id `0x1002d0a3d` unchanged):
@@ -725,26 +737,22 @@ $ qdl list
 WARN: qdl: failed to read iProduct descriptor: Input/Output Error
 ```
 
-Interpretation `[INFERRED]`: the PBL in Sahara mode runs a minimal USB stack. String
-descriptors (`GET_DESCRIPTOR`, type `0x03`) are **control transfers**, and they are the
-fragile part — the device kept answering enumeration at the descriptor/registry level while
-failing string requests. This is consistent with the PBL's reputation for a thin USB
-implementation and with the absence of `iSerialNumber` in the first place.
+The observation establishes that the `iProduct` request failed while registry
+enumeration persisted. It does not establish why the request failed, whether it
+changed Sahara state, or whether repeated enumeration degrades the link. No causal
+claim about later bulk-OUT timeouts follows from this EIO alone.
 
-**Design consequences — these are load-bearing:**
+Current design choices:
 
-1. **Never gate on the serial.** `qdl -S <serial>` is a convenience, not an identity
-   guarantee; it fails outright once the string read does. Key on VID `0x05c6` + interface
-   class `0xFF/0xFF` (+ bulk IN/OUT).
-2. **Never poll.** Each `qdl list` is a real control transfer to a device with a minimal
-   stack. A detector that polls every second is actively degrading the link. Detect on
-   plug-in (IOKit notification) or on explicit user action, then stop.
-3. **Keep a warm handle.** If you must read the serial, read it **once at open** and cache
-   it for the session. Do not re-derive it per operation.
-4. **Treat `(none)` as normal, not as an error.** Surface it as "serial unavailable", not
-   as a device failure — the flash path can still work.
-5. **This is an argument for the `[OBSERVED]` policy already in force on this project:**
-   do not talk to the device unless you intend to proceed. Enumeration is not free.
+1. Avoid descriptor-string reads by default; use physical bus/port identity and
+   interface metadata. Fail if multiple devices cannot be distinguished.
+2. Use bounded discovery and reconnect deadlines without repeatedly requesting
+   strings. The historical suggestion to prohibit all polling was broader than the
+   evidence supports.
+3. If a serial selector is explicitly requested, require an available matching string
+   rather than silently selecting a different device when the string is unavailable.
+4. Report unavailable strings separately from device absence. A missing string does
+   not by itself determine whether bulk transfers work.
 
 ### 4.11 Quirk checklist
 
@@ -760,7 +768,7 @@ implementation and with the absence of `iSerialNumber` in the first place.
 | `900E` | crash-dump, not EDL | class-based match + explicit warning |
 | Quarantine | downloaded binaries blocked | Homebrew or `xattr -dr` |
 | SIP | enabled, irrelevant | — |
-| **String descriptors** | **`iProduct` read can go `EIO`; serial becomes `(none)`** | **detect once, cache, never poll; don't gate on serial** |
+| **String descriptors** | **`iProduct` read can go `EIO`; serial becomes `(none)`** | **avoid default string reads; bounded discovery by physical identity** |
 
 ---
 
@@ -817,18 +825,22 @@ pblexp-macos
 | enumerate | `libusb_get_device_list` + descriptor check | VID `0x05c6`, iface `0xFF/0xFF`, proto ∈ {`0x10`,`0x11`,`0x13`,`0xFF`}, bulk IN+OUT |
 | open | `libusb_open` | no `sudo`, no detach |
 | claim | `libusb_claim_interface(0)` | expect `LIBUSB_ERROR_ACCESS` if contended |
-| read | `libusb_bulk_transfer(ep_in, …, timeout)` | **loop until `n` bytes** — see below |
+| read | `libusb_bulk_transfer(ep_in, …, timeout)` | maxpacket-multiple receive buffer, retained queue for logical reads |
 | write | `libusb_bulk_transfer(ep_out, …)` | chunk ≤ `wMaxPacketSize`-aligned, honour `out_chunk_size` |
 | reset | `libusb_reset_device` | and/or close+rescan on `NO_DEVICE` |
-| serial | parse `_SN:` from `iProduct` | `iSerialNumber` is absent |
+| identity | bus/physical port path plus interface | string selection only when explicitly requested; strings can fail |
 
 Three implementation warnings, all grounded in the sources above:
 
 1. **Bulk reads are not message-framed.** A `libusb_bulk_transfer` may return a short
    read. Sahara/Firehose headers declare a length — you must loop until the declared
    length arrives. Code that assumes one transfer == one message will corrupt the protocol
-   intermittently under load. This is the most likely source of a flaky first port.
-2. **Never cache the handle across Sahara→Firehose** (§4.6). Re-enumerate and re-claim.
+   under load. USB receive buffers must also be maxpacket multiples; a logical
+   8-byte header read must consume a retained queue, not issue an 8-byte USB read.
+   See [libusb overflow guidance](https://libusb.sourceforge.io/api-1.0/libusb_packetoverflow.html).
+   This defect does not explain the recorded first 48-byte bulk-OUT timeout.
+2. **Handle invalidation across Sahara→Firehose** (§4.6) must trigger bounded
+   rediscovery of the same physical device; live behavior remains unvalidated.
 3. **Do not port DTR/RTS/baud.** They are meaningless here and will at best be ignored
    (§4.2).
 
@@ -879,7 +891,9 @@ by the port:
   (`VIP hash table accepted`, `Authentication of signed hash failed`).
 - No OPPO private key; no `ocdt_unlock.img` / `abl_unlock.img` / `xbl_unlock.img` exists.
 - `pblexp`'s **fixed PBL addresses may not match RMX1901** → **hard-brick risk**.
-- The PBL patch bypasses **programmer auth only**, not XBL secure boot.
+- The intended patch concerns programmer auth, but signed-loader success alone
+  does not prove a bypass. No modified/unsigned execution is established, and
+  this transport port provides no evidence of an XBL secure-boot bypass.
 - A full 62-partition backup exists on this Mac — **verify it before any write**.
 
 Porting the transport does not de-risk any of the above. Treat the first exploit run as
@@ -1029,7 +1043,7 @@ Only after 0–5 pass **and** the 62-partition backup is re-verified:
 
 ## 9. One-line answers
 
-1. **No `/dev/cu.usbmodem*` — ever.** 9008 is `0xFF/0xFF/0x10` vendor-specific; AppleUSBACM
+1. **No `/dev/cu.usbmodem*` for the observed interface on stock macOS.** 9008 is `0xFF/0xFF/0x10` vendor-specific; AppleUSBACM
    requires `2/2`. libusb + IOKit, **no kext, no `usbfluxd`, no `sudo`**. VID `0x05C6`,
    PID `0x9008`, no `iSerialNumber` (serial lives in `iProduct` after `_SN:`).
 2. **`qdl` (linux-msm/qdl) is the macOS tool** — `brew install qdl`, official arm64 builds,
@@ -1038,11 +1052,11 @@ Only after 0–5 pass **and** the 62-partition backup is re-verified:
 3. **`qdl list` → `05c6:9008<TAB><serial>`** is the detector (can degrade to
    `05c6:9008<TAB>(none)` — the serial is not guaranteed). `system_profiler SPUSBDataType
    -json` and `ioreg -r -c IOUSBHostInterface` corroborate. `pyserial list_ports` and
-   `ls /dev/cu.*` **cannot** see it — by design, not by misconfiguration.
+   `ls /dev/cu.*` **did not** expose it with the observed stock drivers.
 4. **Quirks:** no tty → no `cu`/`tty`/DTR/RTS/baud; second opener gets
    `LIBUSB_ERROR_ACCESS`; match `IOUSBHostDevice` (not `IOUSBDevice`); handles go stale on
    re-enumeration (250 ms rescan); `900E` is crash-dump, not EDL; quarantine only affects
    downloaded binaries.
-5. **No public macOS Realme/OPPO unlock tool exists.** `pblexp`/`OPPOQcomPatchTool` are
+5. **The original search found no public tool for this exact macOS workflow.** `pblexp`/`OPPOQcomPatchTool` are
    closed Windows binaries. The port is a **transport swap**: replace the COM handle with a
    libusb bulk transport, keep the Sahara/Firehose engine and the `oppo710` payload intact.

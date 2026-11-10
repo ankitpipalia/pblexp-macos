@@ -16,31 +16,23 @@ Subcommands:
   self-test       offline tests (no device)
   list-ports      list candidate Qualcomm 9008 serial ports
 
-macOS port detection uses pyserial's list_ports first, then ioreg and
-system_profiler as fallbacks.  Use --port to override.
+macOS uses packet-buffered libusb bulk endpoints; serial is optional elsewhere.
+Use --port or --usb-bus/--usb-address to select a single device.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import errno
+import math
+import logging
 import os
-import re
 import struct
-import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
-try:
-    import usb.core
-    import usb.util
-except Exception as _usb_exc:  # optional libusb/pyusb fallback
-    usb = None
-    _USB_IMPORT_ERROR = _usb_exc
-else:
-    _USB_IMPORT_ERROR = None
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
     from usb_edl import UsbEdl, find_devices as edl_find_devices, EdlInterface
@@ -85,6 +77,10 @@ RESOURCE_SPECS: Dict[str, Tuple[int, str]] = {
 ZERO_PBLEXP = 0xBF8
 ZERO_PBL_REQUEST = 0xBE8
 ZERO_CHOICES = (ZERO_PBLEXP, ZERO_PBL_REQUEST)
+IMAGE_ID = 0x0D
+MAX_IMAGE_REQUEST = 1024 * 1024
+PACKET_LENGTHS = {0x01: 0x30, 0x03: 0x14, 0x04: 0x10,
+                  0x06: 0x0C, 0x08: 0x08, 0x12: 0x20}
 
 HELLO710 = bytes([
     0x02, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00,
@@ -119,7 +115,7 @@ SAHARA_NAMES = {
     0x0A: "MEMORY_READ32", 0x0B: "READY", 0x0C: "SWITCH_MODE",
     0x0D: "EXECUTE", 0x0E: "EXECUTE_RESP", 0x0F: "EXECUTE_DATA",
     0x10: "MEMORY_DEBUG64", 0x11: "MEMORY_READ64",
-    0x12: "READ_DATA64", 0x13: "RESET_STATE_MACHINE", 0x14: "DONE64",
+    0x12: "READ_DATA64", 0x13: "RESET_STATE_MACHINE", 0x14: "WRITE_DATA",
 }
 
 
@@ -170,11 +166,21 @@ def check_resource(directory: str, name: str) -> Tuple[bool, bytes]:
 
 def load_resources(directory: str, segment1_override: Optional[str] = None,
                    segment1_hash: Optional[str] = None) -> Resources:
+    if segment1_override and not segment1_hash:
+        raise ValueError("--segment1 requires --segment1-hash")
     directory = os.path.abspath(directory)
     if not os.path.isdir(directory):
         raise SystemExit(f"resource directory not found: {directory}")
     loaded: Dict[str, bytes] = {}
     for name in RESOURCE_SPECS:
+        if name == "common_zero_segment.bin" and not os.path.exists(os.path.join(directory, name)):
+            data = bytes(ZERO_PBLEXP)
+            length, digest = RESOURCE_SPECS[name]
+            if len(data) != length or sha256(data) != digest:
+                raise ValueError("generated zero resource does not match manifest")
+            loaded[name] = data
+            log(f"  OK    {name} (generated) sha256={digest}")
+            continue
         if name == "segment1.bin" and segment1_override:
             path = os.path.abspath(segment1_override)
             data = read_file(path)
@@ -212,13 +218,6 @@ def load_resources(directory: str, segment1_override: Optional[str] = None,
             raise SystemExit(f"resource check failed: {os.path.join(directory, expected_name)}")
         loaded[name] = data
 
-    # A missing zero resource is safe to generate; a present non-zero blob is
-    # the known-bad .NET manifest extraction and must not be used.
-    zero_path = os.path.join(directory, "common_zero_segment.bin")
-    if not os.path.exists(zero_path):
-        loaded["common_zero_segment.bin"] = b"\x00" * ZERO_PBLEXP
-        log(f"  OK    common_zero_segment (generated)             "
-            f"{ZERO_PBLEXP:#6x} B  {sha256(loaded['common_zero_segment.bin'])}")
     zero = loaded["common_zero_segment.bin"]
     if len(zero) != ZERO_PBLEXP or any(zero):
         raise SystemExit(f"{zero_path}: not the 0xBF8 all-zero pblexp resource")
@@ -274,314 +273,137 @@ def _list_ports_info() -> List[Tuple[str, str]]:
 
 def _is_9008_text(text: str) -> bool:
     t = text.lower()
-    return (
-        "9008" in t
-        or "qdloader" in t
-        or "qualcomm" in t
-        or ("05c6" in t and "9008" in t)
-    )
-
-
-def _ioreg_candidates() -> List[str]:
-    """Parse ioreg for a 05c6:9008 USB device and its callout device."""
-    try:
-        raw = subprocess.run(
-            ["ioreg", "-p", "IOUSB", "-l", "-w", "0"],
-            capture_output=True, text=True, timeout=8,
-        ).stdout
-    except Exception:
-        return []
-    if not raw:
-        return []
-    # IOReg prints a tree; split at device nodes so a sibling's callout does
-    # not get attributed to the wrong device.
-    blocks = re.split(r"(?=\n\s*\+\-o\s)", raw)
-    found: List[str] = []
-    for block in blocks:
-        low = block.lower()
-        product = "9008" in low or "qdloader" in low
-        vendor = "idvendor\" = 1478" in low or "0x05c6" in low or "05c6" in low
-        prodid = "idproduct\" = 36872" in low or "0x9008" in low or "9008" in low
-        if not ((product or prodid) and (vendor or product)):
-            continue
-        m = re.search(r'"IOCalloutDevice"\s*=\s*"([^"]+)"', block)
-        if m:
-            found.append(m.group(1))
-    # Deduplicate while preserving order.
-    return list(dict.fromkeys(found))
-
-
-def _system_profiler_candidates() -> List[str]:
-    try:
-        raw = subprocess.run(
-            ["system_profiler", "SPUSBDataType", "-json"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
-    except Exception:
-        return []
-    try:
-        import json
-        data = json.loads(raw)
-    except Exception:
-        return []
-    found: List[str] = []
-
-    def walk(node):
-        if isinstance(node, dict):
-            text = " ".join(str(v) for v in node.values() if isinstance(v, (str, int)))
-            if _is_9008_text(text):
-                for key in ("bsd_name", "IOCalloutDevice", "device"):
-                    v = node.get(key)
-                    if isinstance(v, str) and v.startswith("/dev/"):
-                        found.append(v)
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(data)
-    return list(dict.fromkeys(found))
+    return "9008" in t and any(word in t for word in ("05c6", "qualcomm", "qdloader"))
 
 
 def find_9008_port() -> Optional[str]:
-    """Return the first candidate 9008 serial port, or None."""
-    for dev, text in _list_ports_info():
-        if _is_9008_text(text) or dev.lower().startswith("/dev/cu."):
-            if _is_9008_text(text):
-                return dev
-    for dev in _ioreg_candidates() + _system_profiler_candidates():
-        if dev:
-            return dev
-    return None
-
-
-@dataclass
-class UsbCandidate:
-    bus: int
-    address: int
-    serial: str = ""
-    product: str = ""
-
-    @property
-    def label(self) -> str:
-        bits = [f"bus {self.bus} address {self.address}"]
-        if self.product:
-            bits.append(self.product)
-        if self.serial:
-            bits.append(f"serial {self.serial}")
-        return "USB 05c6:9008 (" + ", ".join(bits) + ")"
-
-
-def find_9008_usb(bus: Optional[int] = None,
-                  address: Optional[int] = None) -> List[UsbCandidate]:
-    """Return optional pyusb/libusb candidates for VID 05c6 PID 9008."""
-    if usb is None:
-        return []
-    try:
-        devices = usb.core.find(
-            find_all=True, idVendor=0x05C6, idProduct=0x9008
-        )
-    except Exception:
-        return []
-    out: List[UsbCandidate] = []
-    for dev in devices or []:
-        try:
-            if bus is not None and int(dev.bus) != bus:
-                continue
-            if address is not None and int(dev.address) != address:
-                continue
-            try:
-                serial = dev.serial_number or ""
-            except Exception:
-                serial = ""
-            try:
-                product = dev.product or ""
-            except Exception:
-                product = ""
-            out.append(UsbCandidate(int(dev.bus), int(dev.address),
-                                    serial, product))
-        except Exception:
-            continue
-    return out
+    candidates = [dev for dev, text in _list_ports_info() if _is_9008_text(text)]
+    if len(candidates) > 1:
+        raise RuntimeError("multiple serial EDL devices; select one with --port")
+    return candidates[0] if candidates else None
 
 
 def default_transport_order() -> Tuple[str, ...]:
-    """macOS exposes QDLoader as vendor-specific USB, not a /dev/cu node."""
     return ("usb", "serial") if sys.platform == "darwin" else ("serial", "usb")
 
 
-def qdl_list_output() -> str:
-    try:
-        r = subprocess.run(["qdl", "list"], capture_output=True, text=True,
-                           timeout=6)
-        return (r.stdout + r.stderr).strip()
-    except Exception as exc:
-        return f"(qdl list unavailable: {exc})"
-
-
-def qdl_sees_9008() -> bool:
-    out = qdl_list_output().lower()
-    return bool(out) and "no devices found" not in out and (
-        "9008" in out or "05c6" in out or "qualcomm" in out
-    )
-
-
-def find_edl_interfaces() -> List[object]:
-    """Use usb_edl.find_devices() when available (preferred macOS path)."""
+def find_edl_interfaces(**filters) -> List[object]:
     if not usb_edl:
-        return []
-    try:
-        return [info for _dev, info in edl_find_devices()]
-    except Exception:
-        return []
-
-
-def _is_edl_interface(info: object) -> bool:
-    return usb_edl is not None and isinstance(info, EdlInterface)
+        raise RuntimeError(f"usb_edl unavailable: {_EDL_IMPORT_ERROR}")
+    return [info for _dev, info in edl_find_devices(pid=0x9008, **filters)]
 
 
 def list_ports_report() -> None:
+    """Explicit inventory only: no qdl subprocesses or USB string probes."""
     log(f"platform default transport order: {default_transport_order()}")
-    info = _list_ports_info()
-    log("serial candidates (pyserial):")
-    if not info:
-        log("  (none)")
-    for dev, text in info:
-        log(f"  {dev}  {text}")
-    log("usb candidates (usb_edl/libusb 05c6:9008):")
-    edl_infos = find_edl_interfaces()
-    if not usb_edl:
-        log(f"  usb_edl unavailable: {_EDL_IMPORT_ERROR}")
-    elif not edl_infos:
-        log("  (none)")
-    else:
-        for i in edl_infos:
-            log(f"  if={i.interface} in=0x{i.in_ep:02x} out=0x{i.out_ep:02x} "
-                f"mps={i.in_maxpacket}/{i.out_maxpacket} "
-                f"serial={i.serial!r} product={i.product!r}")
-    log("usb candidates (raw pyusb fallback):")
-    usb_candidates = find_9008_usb()
-    if usb is None:
-        log(f"  unavailable: {_USB_IMPORT_ERROR}")
-    elif not usb_candidates:
-        log("  (none)")
-    else:
-        for c in usb_candidates:
-            log(f"  {c.label}")
-    qdl = qdl_list_output()
-    log("qdl list:")
-    for line in qdl.splitlines() or ["(empty)"]:
-        log(f"  {line}")
-    log("ioreg serial 9008 candidates (fallback only):")
-    for dev in _ioreg_candidates():
-        log(f"  {dev}")
-    log("system_profiler serial 9008 candidates (fallback only):")
-    for dev in _system_profiler_candidates():
-        log(f"  {dev}")
-    serial = find_9008_port()
-    if sys.platform == "darwin" and edl_infos:
-        log(f"selected: usb if={edl_infos[0].interface} "
-            f"serial={edl_infos[0].serial!r} (usb_edl)")
-    elif serial:
-        log(f"selected: serial {serial}")
-    elif edl_infos:
-        log(f"selected: usb if={edl_infos[0].interface} "
-            f"serial={edl_infos[0].serial!r} (usb_edl)")
-    elif usb_candidates:
-        log(f"selected: usb {usb_candidates[0].label}")
-    else:
-        log("selected: (none)")
+    for dev, text in _list_ports_info():
+        log(f"serial: {dev} {text}")
+    try:
+        infos = find_edl_interfaces()
+        for info in infos:
+            log(f"USB bus={info.bus} address={info.address} ports={info.port_numbers} "
+                f"if={info.interface} in=0x{info.in_ep:02x} out=0x{info.out_ep:02x} "
+                f"mps={info.in_maxpacket}/{info.out_maxpacket}")
+        if not infos:
+            log("USB: no 05c6:9008 EDL interface found")
+    except RuntimeError as exc:
+        log(f"USB unavailable: {exc}")
 
 
-def resolve_endpoint(args: argparse.Namespace
-                     ) -> Tuple[str, object]:
-    """Return ('serial', path) or ('usb', UsbCandidate).
+class DeviceNotFound(RuntimeError):
+    pass
 
-    macOS QDLoader 9008 is a vendor-specific USB device (0x05c6:0x9008,
-    interface class 0xFF) with bulk endpoints; it has no /dev/cu node.  Auto
-    mode therefore tries USB first on Darwin and serial first elsewhere.
-    An explicit /dev/cu path still selects serial.
-    """
+
+def resolve_endpoint(args: argparse.Namespace) -> Tuple[str, object]:
     requested = getattr(args, "port", "auto") or "auto"
     kind = getattr(args, "transport", "auto")
+    usb_selector = getattr(args, "usb_bus", None) is not None or getattr(args, "usb_address", None) is not None
+    if usb_selector:
+        if kind == "serial" or requested != "auto":
+            raise ValueError("USB selectors cannot be combined with a serial transport/port")
+        kind = "usb"
+    serial_path = getattr(args, "_serial_path", None)
+    if serial_path:
+        return "serial", serial_path
     if requested != "auto" and kind != "usb":
         return "serial", requested
-
-    order = default_transport_order()
-    if kind == "serial":
-        order = ("serial",)
-    elif kind == "usb":
-        order = ("usb",)
-
+    identity = getattr(args, "_usb_identity", None)
+    order = ("usb",) if identity else default_transport_order()
+    if kind in ("serial", "usb"):
+        order = (kind,)
+    errors = []
     for candidate_kind in order:
-        if candidate_kind == "usb":
-            bus = getattr(args, "usb_bus", None)
-            addr = getattr(args, "usb_address", None)
-            if usb_edl and bus is None and addr is None:
-                infos = find_edl_interfaces()
-                if infos:
-                    return "usb", infos[0]
-            candidates = find_9008_usb(bus, addr)
-            if candidates:
-                return "usb", candidates[0]
+        if candidate_kind == "serial":
+            found = find_9008_port()
+            if found:
+                return "serial", found
+            continue
+        filters = {}
+        if identity:
+            bus, ports, old_address = identity
+            filters = {"bus": bus}
+            filters.update({"port_numbers": ports} if ports else {"address": old_address})
         else:
-            p = find_9008_port()
-            if p:
-                return "serial", p
-
-    if kind == "serial":
-        list_ports_report()
-        raise RuntimeError(
-            "no serial Qualcomm 9008 port found; on macOS the QDLoader "
-            "interface is normally vendor-specific USB, so use "
-            "--transport usb (default on macOS), or pass an explicit "
-            "/dev/cu.* path only if a driver creates one."
-        )
-    if kind == "usb":
-        if usb is None:
-            raise RuntimeError(
-                "USB transport requested but pyusb/libusb is unavailable: "
-                f"{_USB_IMPORT_ERROR}.  Install with "
-                "`python3 -m pip install --user pyusb` (libusb is provided by "
-                "macOS/Homebrew), or use --transport serial on Windows."
-            )
-        list_ports_report()
-        if qdl_sees_9008():
-            raise RuntimeError(
-                "qdl sees a 05c6:9008 device but pyusb did not enumerate it. "
-                "Check libusb/permissions (run `qdl list`), or use the qdl "
-                "CLI directly."
-            )
-        raise RuntimeError(
-            "no USB 05c6:9008 device found; check the cable and that the "
-            "PBL is in EDL.  A wedged PBL needs a power-button reset."
-        )
-
-    list_ports_report()
-    if qdl_sees_9008() and usb is None:
-        raise RuntimeError(
-            "qdl sees a 05c6:9008 device, but pyusb/libusb is unavailable. "
-            "Install pyusb (`python3 -m pip install --user pyusb`) and retry."
-        )
-    raise RuntimeError(
-        "no Qualcomm 9008 transport found.  On macOS use --transport usb "
-        "(pyusb/libusb; default) or install a driver for --transport serial. "
-        "On Windows use --transport serial --port COMx."
-    )
+            if getattr(args, "usb_bus", None) is not None:
+                filters["bus"] = args.usb_bus
+            if getattr(args, "usb_address", None) is not None:
+                filters["address"] = args.usb_address
+        try:
+            infos = find_edl_interfaces(**filters)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            continue
+        if identity:
+            bus, ports, old_address = identity
+            infos = [i for i in infos if i.bus == bus and
+                     ((tuple(i.port_numbers) == ports) if ports else i.address == old_address)]
+        else:
+            bus, address = getattr(args, "usb_bus", None), getattr(args, "usb_address", None)
+            infos = [i for i in infos if (bus is None or i.bus == bus) and
+                     (address is None or i.address == address)]
+        if len(infos) > 1:
+            raise RuntimeError("multiple USB EDL interfaces; select --usb-bus and --usb-address")
+        if infos:
+            return "usb", infos[0]
+    if errors and kind == "usb":
+        raise RuntimeError("; ".join(errors))
+    raise DeviceNotFound("no matching EDL transport found" + (": " + "; ".join(errors) if errors else ""))
 
 
-def open_transport(args: argparse.Namespace):
-    kind, info = resolve_endpoint(args)
-    if kind == "serial":
-        t = SerialTransport(str(info), args.io_timeout)
-    elif _is_edl_interface(info):
-        t = UsbEdlTransport(info, args.io_timeout)  # type: ignore[arg-type]
-    else:
-        t = UsbTransport(info, args.io_timeout)  # type: ignore[arg-type]
-    t.open(args.open_retries, args.open_retry_delay)
-    log(f"transport: {t.description}")
-    return t
+def open_transport(args: argparse.Namespace, reopening: bool = False):
+    timeout = args.reopen_timeout if reopening or getattr(args, "_reopening", False) else args.port_timeout
+    deadline = time.monotonic() + timeout
+    open_attempts = 0
+    last = None
+    while True:
+        try:
+            kind, info = resolve_endpoint(args)
+        except (DeviceNotFound, OSError) as exc:
+            if not isinstance(exc, DeviceNotFound) and not is_disconnect(exc):
+                raise
+            last = exc
+        else:
+            t = (SerialTransport(str(info), args.io_timeout) if kind == "serial" else
+                 UsbEdlTransport(info, args.io_timeout, getattr(args, "usb_cdc", False)))
+            try:
+                open_attempts += 1
+                t.open(1, 0)
+            except Exception as exc:
+                t.close()
+                last = exc
+                if open_attempts >= args.open_retries:
+                    raise RuntimeError(f"could not open EDL transport: {exc}") from exc
+            else:
+                if kind == "usb":
+                    args._usb_identity = (info.bus, tuple(info.port_numbers), info.address)
+                else:
+                    args._serial_path = str(info)
+                log(f"transport: {t.description}")
+                return t
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeviceNotFound(f"EDL discovery/open timed out after {timeout:g}s: {last}")
+        time.sleep(min(args.open_retry_delay, remaining))
 
 
 class ByteTransport:
@@ -678,178 +500,26 @@ class SerialTransport(ByteTransport):
         return self.ser.read(n)
 
 
-class UsbTransport(ByteTransport):
-    """Optional pyusb/libusb bulk transport for VID 05c6 PID 9008.
-
-    macOS may not create a /dev/cu node for the QDLoader interface.  This is a
-    deliberately small fallback: it finds the vendor interface's bulk IN/OUT
-    endpoints and carries the same Sahara bytes.  If pyusb/libusb is missing,
-    selection fails with an explicit message; serial remains the default.
-    """
-
-    def __init__(self, candidate: UsbCandidate, io_timeout: float = 0.2):
-        self.candidate = candidate
-        self.io_timeout = io_timeout
-        self.dev = None
-        self.ep_in = None
-        self.ep_out = None
-        self.cfg = None
-        self.interface = None
-        self.description = candidate.label
-
-    def open(self, retries: int = 5, delay: float = 0.5) -> None:
-        if usb is None:
-            raise RuntimeError(
-                "pyusb/libusb is unavailable: "
-                f"{_USB_IMPORT_ERROR}.  Install pyusb and libusb, or use "
-                "--transport serial with a /dev/cu.* port."
-            )
-        last: Optional[BaseException] = None
-        for attempt in range(1, retries + 1):
-            try:
-                self.dev = usb.core.find(
-                    idVendor=0x05C6, idProduct=0x9008,
-                    bus=self.candidate.bus, address=self.candidate.address,
-                )
-                if self.dev is None:
-                    raise RuntimeError("device disappeared during open")
-                try:
-                    self.dev.set_configuration()
-                except Exception:
-                    # Already configured is normal on some backends.
-                    pass
-                self.cfg = self.dev.get_active_configuration()
-                interfaces = list(self.cfg)
-                preferred = [
-                    i for i in interfaces
-                    if int(getattr(i, "bInterfaceClass", -1)) == 0xFF
-                    and int(getattr(i, "bInterfaceSubClass", -1)) == 0xFF
-                    and int(getattr(i, "bInterfaceProtocol", -1)) == 0xFF
-                ]
-                ordered = preferred + [i for i in interfaces if i not in preferred]
-                self.interface = None
-                self.ep_in = None
-                self.ep_out = None
-                for intf in ordered:
-                    in_ep = usb.util.find_descriptor(
-                        intf,
-                        custom_match=lambda e: (
-                            usb.util.endpoint_direction(e.bEndpointAddress)
-                            == usb.util.ENDPOINT_IN
-                            and usb.util.endpoint_type(e.bmAttributes)
-                            == usb.util.ENDPOINT_TYPE_BULK
-                        ),
-                    )
-                    out_ep = usb.util.find_descriptor(
-                        intf,
-                        custom_match=lambda e: (
-                            usb.util.endpoint_direction(e.bEndpointAddress)
-                            == usb.util.ENDPOINT_OUT
-                            and usb.util.endpoint_type(e.bmAttributes)
-                            == usb.util.ENDPOINT_TYPE_BULK
-                        ),
-                    )
-                    if in_ep is not None and out_ep is not None:
-                        self.interface = intf
-                        self.ep_in = in_ep
-                        self.ep_out = out_ep
-                        break
-                if self.interface is None:
-                    raise RuntimeError(
-                        "no vendor-specific/bulk IN+OUT interface found; "
-                        "interfaces=" + ",".join(
-                            f"{int(getattr(i, 'bInterfaceNumber', -1))}:"
-                            f"class{int(getattr(i, 'bInterfaceClass', -1)):#x}"
-                            for i in interfaces
-                        )
-                    )
-                try:
-                    if self.dev.is_kernel_driver_active(self.interface.bInterfaceNumber):
-                        self.dev.detach_kernel_driver(self.interface.bInterfaceNumber)
-                except Exception:
-                    pass
-                try:
-                    usb.util.claim_interface(self.dev, self.interface)
-                except Exception as exc:
-                    raise RuntimeError(f"claim interface failed: {exc}") from exc
-                time.sleep(0.1)
-                return
-            except Exception as exc:
-                last = exc
-                log(f"open USB {self.candidate.label}: attempt "
-                    f"{attempt}/{retries} failed: {exc}")
-                self.close()
-                time.sleep(delay)
-        raise RuntimeError(f"could not open USB 05c6:9008: {last}")
-
-    def close(self) -> None:
-        if self.dev is not None and usb is not None:
-            try:
-                if self.interface is not None:
-                    usb.util.release_interface(self.dev, self.interface)
-            except Exception:
-                pass
-            try:
-                usb.util.dispose_resources(self.dev)
-            except Exception:
-                pass
-        self.dev = None
-        self.ep_in = None
-        self.ep_out = None
-        self.interface = None
-
-    def write(self, data: bytes) -> None:
-        if self.ep_out is None:
-            raise RuntimeError("USB transport is not open")
-        off = 0
-        while off < len(data):
-            try:
-                n = self.ep_out.write(
-                    data[off:], timeout=max(1, int(self.io_timeout * 5000))
-                )
-            except usb.core.USBTimeoutError as exc:
-                raise RuntimeError(f"USB bulk OUT timeout: {exc}") from exc
-            except usb.core.USBError as exc:
-                raise RuntimeError(f"USB bulk OUT error: {exc}") from exc
-            if not n:
-                raise RuntimeError("USB bulk OUT wrote 0 bytes")
-            off += int(n)
-
-    def read(self, n: int) -> bytes:
-        if self.ep_in is None:
-            raise RuntimeError("USB transport is not open")
-        try:
-            data = self.ep_in.read(
-                n, timeout=max(1, int(self.io_timeout * 1000))
-            )
-            return bytes(data)
-        except usb.core.USBTimeoutError:
-            return b""
-        except usb.core.USBError as exc:
-            raise RuntimeError(f"USB bulk IN error: {exc}") from exc
-
-
 class UsbEdlTransport(ByteTransport):
-    """Adapter around the shared usb_edl.UsbEdl transport."""
-
-    def __init__(self, info: object, io_timeout: float = 0.2):
+    """The single packet-buffered native USB backend."""
+    def __init__(self, info: object, io_timeout: float = 0.2, cdc_requests: bool = False):
         self.info = info
         self.io_timeout = io_timeout
+        self.cdc_requests = cdc_requests
         self.edl = None
-        self.description = (
-            f"USB usb_edl if={getattr(info, 'interface', '?')} "
-            f"in=0x{getattr(info, 'in_ep', 0):02x} "
-            f"out=0x{getattr(info, 'out_ep', 0):02x} "
-            f"serial={getattr(info, 'serial', '')!r}"
-        )
+        self.description = (f"USB bus={info.bus} address={info.address} "
+                            f"ports={info.port_numbers} if={info.interface}")
 
     def open(self, retries: int = 5, delay: float = 0.5) -> None:
-        if not usb_edl:
-            raise RuntimeError(f"usb_edl unavailable: {_EDL_IMPORT_ERROR}")
-        self.edl = UsbEdl(serial=getattr(self.info, "serial", "") or None)
-        # usb_edl wants a longer re-enumeration window; honour the caller's
-        # retry count but provide a sane minimum.
-        self.edl.open(retries=max(retries, 8), delay=delay)
+        if self.edl is not None:
+            return
+        self.edl = UsbEdl(info=self.info, cdc_requests=self.cdc_requests)
+        try:
+            self.edl.open(retries=retries, delay=delay)
+        except Exception:
+            self.edl.close()
+            self.edl = None
+            raise
 
     def close(self) -> None:
         if self.edl is not None:
@@ -859,12 +529,17 @@ class UsbEdlTransport(ByteTransport):
     def write(self, data: bytes) -> None:
         if self.edl is None:
             raise RuntimeError("USB transport is not open")
-        self.edl.write(data, timeout_ms=max(1, int(self.io_timeout * 5000)))
+        self.edl.write(data, timeout_ms=5000)
 
     def read(self, n: int) -> bytes:
         if self.edl is None:
             raise RuntimeError("USB transport is not open")
         return self.edl.read(n, timeout_ms=max(1, int(self.io_timeout * 1000)))
+
+    def read_exact(self, n: int, timeout: float) -> bytes:
+        if self.edl is None:
+            raise RuntimeError("USB transport is not open")
+        return self.edl.read_exact(n, timeout_ms=max(1, int(timeout * 1000)))
 
 
 def parse_packet_header(raw: bytes) -> Tuple[int, int]:
@@ -877,11 +552,15 @@ def parse_packet_header(raw: bytes) -> Tuple[int, int]:
 
 
 def read_variable_packet(port: ByteTransport, timeout: float = 2.0) -> bytes:
+    deadline = time.monotonic() + timeout
     head = port.read_exact(8, timeout)
     if len(head) != 8:
         raise TimeoutError(f"zero response header: got {len(head)} B")
     cmd, length = parse_packet_header(head)
-    rest = port.read_exact(length - 8, timeout)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 and length > 8:
+        raise TimeoutError("Sahara packet body deadline expired")
+    rest = port.read_exact(length - 8, max(remaining, 0.001))
     if len(rest) != length - 8:
         raise TimeoutError(f"zero response body: got {len(head)+len(rest)}/{length} B")
     return head + rest
@@ -899,10 +578,13 @@ class HostStep:
     read_len: int = 0
     expect: str = ""
     repeat: int = 1
+    expected_read: Optional[Tuple[int, int, int]] = None
 
 
 def build_steps(res: Resources, zero_len: int = ZERO_PBLEXP,
                 reset_count: int = 175) -> List[HostStep]:
+    if not 1 <= reset_count <= 10000:
+        raise ValueError("reset_count must be in 1..10000")
     if zero_len not in ZERO_CHOICES:
         raise ValueError(f"zero_len must be one of {ZERO_CHOICES}")
     if zero_len > len(res.zero_segment):
@@ -912,13 +594,13 @@ def build_steps(res: Resources, zero_len: int = ZERO_PBLEXP,
         raise ValueError("zero segment is not all zero")
     return [
         HostStep("hello710", HELLO710, 0x20,
-                 "READ_DATA64 image=0xd offset=0x0 size=0x40"),
+                 "READ_DATA64 image=0xd offset=0x0 size=0x40", expected_read=(13, 0, 64)),
         HostStep("elf_header", res.elf_header, 0x20,
-                 "READ_DATA64 image=0xd offset=0x40 size=0x4d0"),
+                 "READ_DATA64 image=0xd offset=0x40 size=0x4d0", expected_read=(13, 64, 1232)),
         HostStep("program_headers", res.program_headers, 0x20,
-                 "READ_DATA64 image=0xd offset=0x1000 size=0x1000"),
+                 "READ_DATA64 image=0xd offset=0x1000 size=0x1000", expected_read=(13, 4096, 4096)),
         HostStep("segment1", res.segment1, 0x20,
-                 "READ_DATA64 image=0xd offset=0x2000 size=0xbe8"),
+                 "READ_DATA64 image=0xd offset=0x2000 size=0xbe8", expected_read=(13, 8192, 3048)),
         HostStep("zero_segment", zero, 0x10,
                  "END_IMAGE_TX status=0x08 (0xbf8) or HELLO 0x30 (0xbe8)"),
         HostStep("reset_state_machine", RESET_BYTE, 0x30,
@@ -948,95 +630,42 @@ def print_steps(steps: Sequence[HostStep]) -> None:
 
 def send_steps(port: ByteTransport, steps: Sequence[HostStep],
                read_timeout: float = 3.0, strict: bool = True) -> None:
-    for idx, step in enumerate(steps):
-        # The reset step is 175 independent one-byte writes, each followed by
-        # a HELLO read.  Do not coalesce them into one write.
-        if step.name == "reset_state_machine":
-            for i in range(step.repeat):
-                try:
-                    port.write(step.data)
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"TX reset {i + 1}/{step.repeat} failed: {exc}. "
-                        "The PBL may have dropped USB; power-cycle before "
-                        "retrying."
-                    ) from exc
-                try:
-                    raw = port.read_exact(0x30, read_timeout)
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"RX reset {i + 1}/{step.repeat} failed: {exc}"
-                    ) from exc
-                if len(raw) != 0x30:
-                    raise RuntimeError(
-                        f"reset {i + 1}/{step.repeat}: got {len(raw)}/0x30 B"
-                    )
-                cmd, length = struct.unpack_from("<II", raw, 0)
-                if cmd != 0x01:
-                    msg = (f"reset {i + 1}/{step.repeat}: expected HELLO, "
-                           f"got {SAHARA_NAMES.get(cmd, hex(cmd))}")
-                    if strict:
-                        raise RuntimeError(msg)
-                    log(f"       WARN {msg}")
-                if (i + 1) % 25 == 0 or i + 1 == step.repeat:
-                    log(f"       reset {i + 1}/{step.repeat}")
-            continue
+    def mismatch(message):
+        if strict:
+            raise RuntimeError(message)
+        log(f"WARN {message}")
 
-        data = step.data * step.repeat
-        try:
-            port.write(data)
-        except Exception as exc:
-            raise RuntimeError(
-                f"TX {step.name} failed: {exc}.  The PBL may have dropped USB; "
-                "power-cycle before retrying."
-            ) from exc
-        log(f"[{idx:02d}] TX {step.name:24s} {len(data):#7x} B")
-        if step.read_len == 0:
-            continue
-        if step.name == "zero_segment":
-            try:
-                pkt = read_variable_packet(port, read_timeout)
-                cmd, length = parse_packet_header(pkt)
-                if cmd == 0x04 and length >= 0x10:
-                    image, status = struct.unpack_from("<II", pkt, 8)
-                    log(f"       RX END_IMAGE_TX image={image:#x} status={status:#x}")
+    for step in steps:
+        for index in range(step.repeat):
+            port.write(step.data)
+            if not step.read_len:
+                continue
+            raw = read_variable_packet(port, read_timeout)
+            cmd, length = parse_packet_header(raw)
+            expected_length = PACKET_LENGTHS.get(cmd)
+            if expected_length is None or length != expected_length:
+                raise ValueError(f"invalid {SAHARA_NAMES.get(cmd, hex(cmd))} length {length:#x}")
+            if step.name == "reset_state_machine":
+                if cmd != 0x01:
+                    mismatch(f"reset {index + 1}: expected HELLO, got {cmd:#x}")
+                if (index + 1) % 25 == 0 or index + 1 == step.repeat:
+                    log(f"reset {index + 1}/{step.repeat}")
+            elif step.name == "zero_segment":
+                valid = False
+                if cmd == 0x04:
+                    image, status = struct.unpack_from("<II", raw, 8)
+                    valid = image == IMAGE_ID and status == 8 and len(step.data) == ZERO_PBLEXP
+                    log(f"RX zero END_IMAGE_TX image={image:#x} status={status:#x}")
                 elif cmd == 0x01:
-                    log(f"       RX HELLO {length:#x} B (entry/reset, not a "
-                        f"success ack)")
-                else:
-                    log(f"       RX {SAHARA_NAMES.get(cmd, hex(cmd))} {length:#x} B")
-                port.drain(0.2)
-            except Exception as exc:
-                msg = f"zero response read failed: {exc}"
-                if strict:
-                    raise RuntimeError(msg) from exc
-                log(f"       WARN {msg}")
-            continue
-        try:
-            raw = port.read_exact(step.read_len, read_timeout)
-        except Exception as exc:
-            raise RuntimeError(
-                f"RX {step.name} failed: {exc}.  Check the PBL state; a power "
-                "cycle may be required."
-            ) from exc
-        if len(raw) != step.read_len:
-            msg = f"RX {step.name}: got {len(raw)}/{step.read_len} B"
-            if strict:
-                raise RuntimeError(msg)
-            log(f"       WARN {msg}")
-            continue
-        cmd, length = struct.unpack_from("<II", raw, 0)
-        name = SAHARA_NAMES.get(cmd, f"CMD_{cmd:#x}")
-        detail = ""
-        if cmd == 0x12 and length >= 0x20:
-            image, off, size = struct.unpack_from("<QQQ", raw, 8)
-            detail = f" image={image:#x} offset={off:#x} size={size:#x}"
-        log(f"       RX {name} {length:#x} B{detail}")
-        if step.name == "reset_state_machine" and cmd != 0x01:
-            msg = f"reset {idx} returned {name}, not HELLO"
-            if strict:
-                raise RuntimeError(msg)
-            log(f"       WARN {msg}")
+                    valid = len(step.data) == ZERO_PBL_REQUEST
+                    log("RX zero HELLO (entry/reset, not success acknowledgement)")
+                if not valid:
+                    mismatch("unexpected zero-stage response for selected zero length")
+            elif step.expected_read:
+                if cmd != 0x12 or decode_read(raw) != step.expected_read:
+                    mismatch(f"{step.name}: expected READ_DATA64 {step.expected_read}; got {raw.hex()}")
+            if step.name != "reset_state_machine":
+                log(f"TX {step.name}: {len(step.data):#x} B; RX {SAHARA_NAMES.get(cmd, hex(cmd))}")
     log("HOST SEQUENCE COMPLETE")
 
 
@@ -1065,6 +694,7 @@ class ServeResult:
     bytes_served: int = 0
     end_image_tx: Optional[Tuple[int, int]] = None
     done_resp: bool = False
+    done_status: Optional[int] = None
     firehose: bytes = b""
     opened_transport: str = ""
 
@@ -1072,10 +702,9 @@ class ServeResult:
 def try_parse(buf: bytearray) -> Optional[Tuple[int, int, bytes]]:
     if len(buf) < 8:
         return None
-    cmd, length = struct.unpack_from("<II", buf, 0)
-    if length < 8 or length > 0x100000:
-        del buf[0]
-        return None
+    cmd, length = parse_packet_header(buf[:8])
+    if cmd not in PACKET_LENGTHS or length != PACKET_LENGTHS[cmd]:
+        raise ValueError(f"unexpected Sahara command/length: {cmd:#x}/{length:#x}")
     if len(buf) < length:
         return None
     raw = bytes(buf[:length])
@@ -1084,158 +713,171 @@ def try_parse(buf: bytearray) -> Optional[Tuple[int, int, bytes]]:
 
 
 def decode_read(raw: bytes) -> Tuple[int, int, int]:
-    cmd, length = struct.unpack_from("<II", raw, 0)
-    if cmd == 0x12 and length >= 0x20:
-        image, off, size = struct.unpack_from("<QQQ", raw, 8)
-        return image, off, size
-    if cmd == 0x03 and length >= 0x14:
-        image, off, size = struct.unpack_from("<III", raw, 8)
-        return image, off, size
-    raise ValueError(f"not a READ_DATA packet: cmd={cmd:#x} len={length:#x}")
+    cmd, length = parse_packet_header(raw)
+    if len(raw) != length:
+        raise ValueError("READ_DATA packet length mismatch")
+    if cmd == 0x12 and length == 0x20:
+        return struct.unpack_from("<QQQ", raw, 8)
+    if cmd == 0x03 and length == 0x14:
+        return struct.unpack_from("<III", raw, 8)
+    raise ValueError(f"not a valid READ_DATA packet: cmd={cmd:#x} len={length:#x}")
 
 
 def serve_chunk(image: bytes, off: int, size: int) -> bytes:
-    if off < 0 or size < 0:
-        return b""
-    if off >= len(image):
-        return b"\0" * size
-    chunk = image[off:off + size]
-    if len(chunk) < size:
-        chunk += b"\0" * (size - len(chunk))
-    return chunk
+    if off < 0 or size <= 0 or size > MAX_IMAGE_REQUEST or off > len(image) or size > len(image) - off:
+        raise ValueError(f"invalid programmer range offset={off:#x} size={size:#x} image={len(image):#x}")
+    return image[off:off + size]
 
 
-def run_serve(args: argparse.Namespace, image_path: str) -> int:
-    image = read_file(image_path)
+def read_programmer(path: str) -> bytes:
+    image = read_file(path)
+    if not image:
+        raise ValueError("programmer image is empty")
+    return image
+
+
+def is_disconnect(exc: BaseException) -> bool:
+    return (getattr(exc, "errno", None) in (errno.ENODEV, errno.ENXIO, errno.EIO) or
+            getattr(exc, "backend_error_code", None) in (-4, -1))
+
+
+def configure_exchange(port: ByteTransport, args: argparse.Namespace,
+                       timeout: float) -> Tuple[ByteTransport, bytes]:
+    payload = CONFIGURE_UFS if args.xml == "ufs" else CONFIGURE_EMMC
+    deadline = time.monotonic() + timeout
+    buf = bytearray()
+    recovered = False
+    need_write = True
+    while time.monotonic() < deadline:
+        try:
+            if need_write:
+                port.write(payload)
+                log(f"TX configure ({args.xml}): {len(payload)} B")
+                need_write = False
+            chunk = port.read(0x10000)
+            if chunk:
+                buf += chunk
+                if b"<response" in buf:
+                    break
+                if len(buf) > MAX_IMAGE_REQUEST:
+                    raise ValueError("Firehose response exceeds 1 MiB")
+        except Exception as exc:
+            if is_disconnect(exc) and not args.no_reopen and not recovered:
+                log(f"USB transition during configure: {exc}; reopening selected device")
+                port.close()
+                recovered = True
+                try:
+                    port = open_transport(args, reopening=True)
+                except Exception as reopen_exc:
+                    log(f"configure reopen failed: {reopen_exc}")
+                    break
+                need_write = True
+                buf.clear()
+                continue
+            log(f"configure failed: {exc}")
+            break
+    return port, bytes(buf)
+
+
+def run_serve(args: argparse.Namespace, image_path: str,
+              image_data: Optional[bytes] = None) -> int:
+    image = read_programmer(image_path) if image_data is None else image_data
+    if not image:
+        raise ValueError("programmer image is empty")
     log(f"image: {image_path} ({len(image):#x} B) sha256={sha256(image)}")
     if args.dry_run:
-        log(f"port: {args.port} (not opened)")
-        log(f"loader HELLO_RESP: {len(LOADER_HELLO):#x} B; "
-            f"xml={args.xml}")
-        log(f"expect {sum(1 for _ in image):#x} image bytes served")
+        log(f"loader HELLO_RESP: {len(LOADER_HELLO):#x} B; xml={args.xml}")
         return 0
     port = open_transport(args)
     result = ServeResult(opened_transport=port.description)
     buf = bytearray()
     deadline = time.monotonic() + args.total_timeout
-    sent_hello = not args.no_hello
-    done_deadline = 0.0
+    awaiting_done = False
+    rejected = False
+    recovered = False
+    need_hello = not args.no_hello
     try:
-        port.open(args.open_retries, args.open_retry_delay)
-        if sent_hello:
-            port.write(LOADER_HELLO)
-            log(f"TX loader HELLO_RESP: {len(LOADER_HELLO):#x} B")
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not result.done_resp and not rejected:
             try:
+                if need_hello:
+                    port.write(LOADER_HELLO)
+                    need_hello = False
                 chunk = port.read(0x10000)
-            except PermissionError as exc:
-                log(f"RX PermissionError (USB transition): {exc}")
-                if result.end_image_tx and result.end_image_tx[1] == 0:
-                    break
-                if result.read_requests == 0 and not args.no_reopen:
-                    log("reopening after USB re-enumeration")
+            except Exception as exc:
+                if is_disconnect(exc) and result.read_requests == 0 and not args.no_reopen and not recovered:
                     port.close()
-                    time.sleep(args.handoff_delay)
-                    try:
-                        port = open_transport(args)
-                        result.opened_transport = port.description
-                        if sent_hello:
-                            port.write(LOADER_HELLO)
-                        continue
-                    except Exception as re_exc:
-                        log(f"reopen failed: {re_exc}")
-                        break
+                    recovered = True
+                    port = open_transport(args, reopening=True)
+                    result.opened_transport = port.description
+                    buf.clear()
+                    need_hello = not args.no_hello
+                    continue
+                log(f"Sahara read failed: {exc}")
                 break
-            except Exception as exc:
-                log(f"RX error: {exc}")
-                break
-            if chunk:
-                buf += chunk
-                while True:
-                    pkt = try_parse(buf)
-                    if pkt is None:
-                        break
-                    cmd, length, raw = pkt
-                    name = SAHARA_NAMES.get(cmd, f"CMD_{cmd:#x}")
-                    if cmd == 0x01:
-                        log(f"RX HELLO {length:#x} B; sending HELLO_RESP")
-                        port.write(LOADER_HELLO)
-                        sent_hello = True
-                        continue
-                    if cmd in (0x12, 0x03):
-                        image_id, off, size = decode_read(raw)
-                        data = serve_chunk(image, off, size)
-                        result.read_requests += 1
-                        result.bytes_served += len(data)
-                        if result.read_requests <= 8 or result.read_requests % 32 == 0:
-                            log(f"RX {name} image={image_id} off={off:#x} "
-                                f"size={size:#x} served={len(data):#x} "
-                                f"total={result.bytes_served:#x}")
-                        port.write(data)
-                        continue
-                    if cmd == 0x04:
-                        image_id, status = struct.unpack_from("<II", raw, 8)
-                        result.end_image_tx = (image_id, status)
-                        log(f"RX END_IMAGE_TX image={image_id:#x} status={status:#x}")
-                        if status == 0:
-                            port.write(DONE)
-                            log(f"TX DONE: {len(DONE):#x} B")
-                            done_deadline = time.monotonic() + 2.0
-                        else:
-                            # A non-zero END_IMAGE_TX is terminal; do not wait
-                            # for the full 90 s loader window.
-                            break
-                        continue
-                    if cmd == 0x06:
-                        result.done_resp = True
-                        log(f"RX DONE_RESP {length:#x} B: {hx(raw)}")
-                        continue
-                    log(f"RX {name} {length:#x} B: {hx(raw)}")
-            else:
-                if result.end_image_tx and result.end_image_tx[1] == 0:
-                    if time.monotonic() >= done_deadline:
-                        break
-        if result.end_image_tx and result.end_image_tx[1] == 0 and args.xml != "none":
-            time.sleep(1.0)
-            payload = CONFIGURE_UFS if args.xml == "ufs" else CONFIGURE_EMMC
-            try:
-                port.write(payload)
-                log(f"TX configure XML ({args.xml}): {len(payload)} B")
-            except Exception as exc:
-                log(f"configure write failed: {exc}")
-            end = time.monotonic() + 8.0
-            while time.monotonic() < end:
-                try:
-                    chunk = port.read(0x10000)
-                except Exception as exc:
-                    log(f"configure read error: {exc}")
+            if not chunk:
+                continue
+            buf += chunk
+            while buf:
+                pkt = try_parse(buf)
+                if pkt is None:
                     break
-                if chunk:
-                    result.firehose += chunk
-                    log(f"RX firehose {len(chunk)} B: {hx(chunk, 160)}")
-                    if b"<response" in result.firehose:
+                cmd, length, raw = pkt
+                if cmd == 0x01:
+                    if awaiting_done:
+                        raise ValueError("HELLO before DONE_RESP")
+                    port.write(LOADER_HELLO)
+                elif cmd in (0x12, 0x03):
+                    if awaiting_done:
+                        raise ValueError("READ_DATA before DONE_RESP")
+                    image_id, off, size = decode_read(raw)
+                    if image_id != IMAGE_ID:
+                        raise ValueError(f"unsupported programmer image id {image_id:#x}")
+                    data = serve_chunk(image, off, size)
+                    port.write(data)
+                    result.read_requests += 1
+                    result.bytes_served += len(data)
+                elif cmd == 0x04:
+                    if awaiting_done:
+                        raise ValueError("duplicate END_IMAGE_TX before DONE_RESP")
+                    image_id, status = struct.unpack_from("<II", raw, 8)
+                    if image_id != IMAGE_ID:
+                        raise ValueError(f"unexpected END_IMAGE_TX image {image_id:#x}")
+                    result.end_image_tx = image_id, status
+                    log(f"RX END_IMAGE_TX image={image_id:#x} status={status:#x}")
+                    if status != 0:
+                        rejected = True
                         break
+                    if not result.read_requests:
+                        raise ValueError("END_IMAGE_TX success before any image requests")
+                    awaiting_done = True
+                    port.write(DONE)
+                elif cmd == 0x06:
+                    if not awaiting_done:
+                        raise ValueError("DONE_RESP without accepted image and DONE")
+                    status = struct.unpack_from("<I", raw, 8)[0]
+                    if status not in (0, 1):
+                        raise ValueError(f"invalid DONE_RESP status {status}")
+                    result.done_status = status
+                    result.done_resp = status == 1
+                    awaiting_done = False
+                    log(f"RX DONE_RESP: {'complete' if status else 'pending'}")
+                    if result.done_resp:
+                        break
+                else:
+                    raise ValueError(f"unexpected Sahara command {cmd:#x}")
+        if result.done_resp and args.xml != "none":
+            port, result.firehose = configure_exchange(port, args, 8.0)
     finally:
         port.close()
-
-    log("")
-    log("=" * 70)
-    log(f"transport:          {result.opened_transport}")
-    log(f"READ_DATA requests: {result.read_requests}")
-    log(f"bytes served:       {result.bytes_served:#x}")
-    log(f"END_IMAGE_TX:       {result.end_image_tx}")
-    log(f"DONE_RESP:          {result.done_resp}")
-    log(f"firehose response:  {hx(result.firehose, 200) or '-'}")
-    if b"<response" in result.firehose:
-        log("RESULT: programmer executed and answered Firehose XML")
+    log(f"READ_DATA requests: {result.read_requests}; bytes served: {result.bytes_served:#x}")
+    log(f"END_IMAGE_TX: {result.end_image_tx}; DONE status: {result.done_status}")
+    if result.done_resp and (args.xml == "none" or b"<response" in result.firehose):
+        log("RESULT: Sahara complete" + ("; programmer answered Firehose" if result.firehose else ""))
         return 0
     if result.end_image_tx and result.end_image_tx[1] == 0:
-        log("RESULT: programmer image accepted (status 0) but no XML answer")
+        log("RESULT: image accepted; Sahara completion or requested Firehose response missing")
         return 2
-    if result.read_requests:
-        log("RESULT: loader requests seen, image not completed")
-        return 3
-    log("RESULT: no loader/READ_DATA packets (phase did not run or loader not ready)")
+    log("RESULT: image rejected or Sahara transfer incomplete")
     return 3
 
 
@@ -1246,27 +888,12 @@ def run_serve(args: argparse.Namespace, image_path: str) -> int:
 
 def run_ping(args: argparse.Namespace) -> int:
     port = open_transport(args)
-    payload = CONFIGURE_UFS if args.xml == "ufs" else CONFIGURE_EMMC
     try:
-        port.write(payload)
-        log(f"TX configure ({args.xml}): {len(payload)} B")
-        buf = b""
-        end = time.monotonic() + args.timeout
-        while time.monotonic() < end:
-            try:
-                chunk = port.read(0x10000)
-            except Exception as exc:
-                log(f"RX error: {exc}")
-                break
-            if chunk:
-                buf += chunk
-                log(f"RX {len(chunk)} B: {hx(chunk, 200)}")
-                if b"<response" in buf:
-                    break
+        port, buf = configure_exchange(port, args, args.timeout)
     finally:
         port.close()
     if b"<response" in buf:
-        log("RESULT: programmer responded")
+        log("RESULT: programmer responded (execution ping; ACK/NAK is not a configuration verdict)")
         return 0
     log("RESULT: no Firehose response")
     return 2
@@ -1278,6 +905,7 @@ def run_ping(args: argparse.Namespace) -> int:
 
 
 def run_all(args: argparse.Namespace, res: Resources, image_path: str) -> int:
+    image = read_programmer(image_path)
     steps = build_steps(res, args.zero_len, args.reset_count)
     print_steps(steps)
     if args.dry_run:
@@ -1291,7 +919,8 @@ def run_all(args: argparse.Namespace, res: Resources, image_path: str) -> int:
     log(f"handoff: waiting {args.handoff_delay:.2f}s")
     time.sleep(args.handoff_delay)
     # The PBL may re-enumerate; resolve again rather than trusting the old path.
-    return run_serve(args, image_path)
+    args._reopening = True
+    return run_serve(args, image_path, image_data=image)
 
 
 # ---------------------------------------------------------------------------
@@ -1307,8 +936,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
     image = resolve_image(args.image)
     if image:
-        data = read_file(image)
-        log(f"  OK    {os.path.basename(image):44s} {len(data):#6x} B  "
+        data = read_programmer(image)
+        log(f"  READABLE    {os.path.basename(image):44s} {len(data):#6x} B  "
             f"{sha256(data)}")
     else:
         log("  (no programmer image found; pass --image for the serve test)")
@@ -1316,35 +945,27 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_dry(args: argparse.Namespace) -> int:
-    res = load_resources(args.resources, args.segment1, args.segment1_hash)
-    if args.mode == "host":
+    mode = args.mode if args.cmd == "dry-run" else args.cmd
+    if mode in ("host", "all"):
+        res = load_resources(args.resources, args.segment1, args.segment1_hash)
         print_steps(build_steps(res, args.zero_len, args.reset_count))
-        return 0
-    if args.mode == "all":
-        print_steps(build_steps(res, args.zero_len, args.reset_count))
-        image = resolve_image(args.image)
-        log(f"handoff: {args.handoff_delay:.2f}s")
-        log(f"serve image: {image or '(none found)'}")
-        return 0
-    if args.mode == "serve":
+    if mode in ("serve", "all"):
         image = resolve_image(args.image)
         if not image:
-            log("no programmer image found; pass --image")
-            return 1
-        log(f"serve image: {image}")
-        log(f"loader HELLO_RESP: {len(LOADER_HELLO):#x} B")
-        log(f"xml: {args.xml}")
-        return 0
-    if args.mode == "ping":
-        log(f"configure XML ({args.xml}): "
-            f"{len(CONFIGURE_UFS if args.xml == 'ufs' else CONFIGURE_EMMC)} B")
-        return 0
-    raise SystemExit(f"unknown dry-run mode {args.mode}")
+            raise ValueError("no programmer image found; pass --image")
+        data = read_programmer(image)
+        log(f"serve image: {image} ({len(data):#x} B) sha256={sha256(data)}")
+        log(f"loader HELLO_RESP: {len(LOADER_HELLO):#x} B; xml={args.xml}")
+    if mode == "all":
+        log(f"handoff: {args.handoff_delay:.2f}s")
+    if mode == "ping":
+        log(f"configure XML ({args.xml}): {len(CONFIGURE_UFS if args.xml == 'ufs' else CONFIGURE_EMMC)} B")
+    return 0
 
 
 def self_test() -> int:
-    here = os.path.dirname(os.path.abspath(__file__))
-    res = load_resources(os.path.join(here, "resources"))
+    res = Resources("synthetic", bytes(0x40), bytes(0x4d0), bytes(0x1000),
+                    bytes(0x3f0), bytes(0x3a8), bytes(ZERO_PBLEXP))
     steps = build_steps(res, ZERO_PBLEXP, 175)
     assert [s.name for s in steps][-2:] == ["segment2", "segment3"]
     assert sum(len(s.data) * s.repeat for s in steps) == (
@@ -1359,11 +980,16 @@ def self_test() -> int:
     pkt32 = struct.pack("<IIIII", 0x03, 0x14, 13, 0x40, 0x4D0)
     parsed32 = try_parse(bytearray(pkt32))
     assert parsed32 and decode_read(parsed32[2]) == (13, 0x40, 0x4D0)
-    # serve padding / range
+    # bounded image ranges
     img = bytes(range(256)) * 4
     assert serve_chunk(img, 0, 64) == img[:64]
-    assert serve_chunk(img, 2000, 16) == b"\0" * 16
-    assert serve_chunk(img, 1020, 10) == img[1020:1024] + b"\0" * 6
+    for offset, size in ((2000, 16), (1020, 10)):
+        try:
+            serve_chunk(img, offset, size)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-range request accepted")
     # loader hello layout
     assert struct.unpack_from("<II", LOADER_HELLO, 0) == (2, 0x30)
     assert struct.unpack_from("<IIII", LOADER_HELLO, 8) == (2, 1, 0, 0)
@@ -1417,6 +1043,41 @@ def self_test() -> int:
 # ---------------------------------------------------------------------------
 
 
+def positive_seconds(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return result
+
+
+def nonnegative_seconds(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("must be a finite nonnegative number")
+    return result
+
+
+def bounded_count(value: str) -> int:
+    result = int(value)
+    if not 1 <= result <= 10000:
+        raise argparse.ArgumentTypeError("must be in 1..10000")
+    return result
+
+
+def usb_bus_number(value: str) -> int:
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("USB bus must be nonnegative")
+    return result
+
+
+def usb_device_address(value: str) -> int:
+    result = int(value)
+    if not 1 <= result <= 127:
+        raise argparse.ArgumentTypeError("USB address must be in 1..127")
+    return result
+
+
 def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--transport", choices=["auto", "serial", "usb"],
                    default="auto",
@@ -1424,9 +1085,11 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--port", default="auto",
                    help="serial port path or 'auto' (default: auto; ignored "
                         "for --transport usb)")
-    p.add_argument("--usb-bus", type=int, default=None,
+    p.add_argument("--usb-cdc", action="store_true",
+                   help="experimental opt-in CDC class requests (not proven required)")
+    p.add_argument("--usb-bus", type=usb_bus_number, default=None,
                    help="optional libusb bus number for USB selection")
-    p.add_argument("--usb-address", type=int, default=None,
+    p.add_argument("--usb-address", type=usb_device_address, default=None,
                    help="optional libusb device address for USB selection")
     p.add_argument("--resources", default=default_resources(),
                    help="resource directory (default: ./resources)")
@@ -1434,22 +1097,22 @@ def add_common(p: argparse.ArgumentParser) -> None:
                    help="override segment1.bin (e.g. a patched payload)")
     p.add_argument("--segment1-hash", default=None,
                    help="expected SHA-256 for the segment1 resource/override")
-    p.add_argument("--io-timeout", type=float, default=0.2,
+    p.add_argument("--io-timeout", type=positive_seconds, default=0.2,
                    help="serial read timeout in seconds")
-    p.add_argument("--port-timeout", type=float, default=8.0,
+    p.add_argument("--port-timeout", type=positive_seconds, default=8.0,
                    help="seconds to wait for auto-detection")
-    p.add_argument("--reopen-timeout", type=float, default=10.0,
+    p.add_argument("--reopen-timeout", type=positive_seconds, default=10.0,
                    help="seconds to wait for re-enumeration")
-    p.add_argument("--open-retries", type=int, default=5)
-    p.add_argument("--open-retry-delay", type=float, default=0.5)
-    p.add_argument("--handoff-delay", type=float, default=1.0,
+    p.add_argument("--open-retries", type=bounded_count, default=5)
+    p.add_argument("--open-retry-delay", type=positive_seconds, default=0.5)
+    p.add_argument("--handoff-delay", type=nonnegative_seconds, default=1.0,
                    help="delay after segment3 before handoff/serve")
     p.add_argument("--zero-len", type=lambda s: int(s, 0), default=ZERO_PBLEXP,
                    choices=ZERO_CHOICES)
-    p.add_argument("--reset-count", type=int, default=175)
-    p.add_argument("--read-timeout", type=float, default=3.0)
+    p.add_argument("--reset-count", type=bounded_count, default=175)
+    p.add_argument("--read-timeout", type=positive_seconds, default=3.0)
     p.add_argument("--relaxed", action="store_true",
-                   help="log and continue on missing/odd responses")
+                   help="allow well-formed unexpected host responses; framing/timeouts still fail")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-reopen", action="store_true",
                    help="serve: do not reopen after a USB transition")
@@ -1457,8 +1120,8 @@ def add_common(p: argparse.ArgumentParser) -> None:
                    help="programmer image path (serve/all)")
     p.add_argument("--xml", choices=["ufs", "emmc", "none"], default="ufs")
     p.add_argument("--no-hello", action="store_true",
-                   help="serve: do not send loader HELLO_RESP")
-    p.add_argument("--total-timeout", type=float, default=90.0)
+                   help="serve: skip unsolicited initial HELLO_RESP; still answer device HELLO")
+    p.add_argument("--total-timeout", type=positive_seconds, default=90.0)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1479,7 +1142,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     p_ping = sub.add_parser("ping", help="send benign Firehose configure")
     add_common(p_ping)
-    p_ping.add_argument("--timeout", type=float, default=10.0)
+    p_ping.add_argument("--timeout", type=positive_seconds, default=10.0)
 
     p_check = sub.add_parser("check-resources")
     p_check.add_argument("--resources", default=default_resources())
@@ -1496,38 +1159,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub.add_parser("list-ports")
 
     args = ap.parse_args(argv)
-
-    if args.cmd == "self-test":
-        return self_test()
-    if args.cmd == "list-ports":
-        list_ports_report()
-        return 0
-    if args.cmd == "check-resources":
-        return cmd_check(args)
-    if args.cmd == "dry-run":
-        # dry-run should not require a serial port, but it does require the
-        # same resource verification and prints the exact sequence.
-        args.port = "auto"
-        return cmd_dry(args)
+    if (getattr(args, "usb_bus", None) is not None or getattr(args, "usb_address", None) is not None) and (
+            getattr(args, "transport", "auto") == "serial" or getattr(args, "port", "auto") != "auto"):
+        ap.error("USB selectors cannot be combined with a serial transport/port")
+    if (args.cmd == "ping" or (args.cmd == "dry-run" and args.mode == "ping")) and args.xml == "none":
+        ap.error("ping requires --xml ufs or emmc")
+    if getattr(args, "usb_cdc", False):
+        logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
     try:
+        if args.cmd == "self-test":
+            return self_test()
+        if args.cmd == "list-ports":
+            list_ports_report()
+            return 0
+        if args.cmd == "check-resources":
+            return cmd_check(args)
+        if args.cmd == "dry-run" or getattr(args, "dry_run", False):
+            return cmd_dry(args)
         if args.cmd == "ping":
-            if args.dry_run:
-                return cmd_dry(args)
             return run_ping(args)
-
-        res = load_resources(args.resources, args.segment1, args.segment1_hash)
         image = resolve_image(args.image)
-        if args.cmd in ("serve", "all") and not image:
-            raise SystemExit("no programmer image found; pass --image PATH")
+        if args.cmd in ("serve", "all"):
+            if not image:
+                raise ValueError("no programmer image found; pass --image PATH")
+            # Preflight before either host resource upload or device selection.
+            read_programmer(image)
+        if args.cmd == "serve":
+            return run_serve(args, image)
+        res = load_resources(args.resources, args.segment1, args.segment1_hash)
         if args.cmd == "host":
             return run_host(args, res)
-        if args.cmd == "serve":
-            return run_serve(args, image)  # type: ignore[arg-type]
         if args.cmd == "all":
-            return run_all(args, res, image)  # type: ignore[arg-type]
-        raise SystemExit(f"unknown command {args.cmd}")
-    except Exception as exc:
+            return run_all(args, res, image)
+        raise ValueError(f"unknown command {args.cmd}")
+    except (Exception, SystemExit) as exc:
         log(f"ERROR: {exc}")
         return 1
 
