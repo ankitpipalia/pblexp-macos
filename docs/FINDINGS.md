@@ -87,8 +87,10 @@ historical first 48-byte Hello710 bulk OUT timeout had the same cause.
 
 The signed-programmer run proves the native macOS host, loader handoff, and
 Firehose programmer path. It does **not** prove the PBL auth bypass: a
-normal, signed programmer loads without the exploit patch. The modified
-programmer and loader-table candidate remain untested.
+normal, signed programmer loads without the exploit patch. The modified-
+programmer and table-candidate results are recorded in
+[EVIDENCE.md](EVIDENCE.md); the corrected v3 table candidate is not yet
+tested.
 
 Descriptor `iProduct` reads returned EIO while the device stayed enumerated;
 that does not establish that those reads caused the later state. The 8-byte
@@ -161,16 +163,27 @@ programmer is running.  It does not recover a PBL already wedged in
 ## Separate auth and unlock research
 
 No unsigned or modified programmer execution and no bootloader unlock have
-been demonstrated. The recorded modified programmer was rejected with
-END_IMAGE_TX image `0xd` status `1`.
+been demonstrated. Two **different** modified-programmer observations must
+not be merged:
+
+- `W-PHASEC` (historical Windows `pblexp`, original phase payload):
+  `devprg_710_mod.bin` was rejected with `END_IMAGE_TX image=0xd status=1`.
+- `M-MOD-PF2` / `M-MOD-LT2` (native macOS, 2026-11-10): the same modified
+  image served all 181 READ_DATA64 bytes, then the device reset before
+  `END_IMAGE_TX`/`DONE_RESP`.
+
+`M-MOD-LT2` used `segment1_loader_table_v2.bin`, whose resident stub was
+malformed (`UDF`), so it is not a valid table-patch result. The full
+experiment table is in [EVIDENCE.md](EVIDENCE.md).
 
 Private firmware analysis recorded status `1` as the Sahara default at
 `0x308f34`, an early return in `FUN_0030DE40` when finalize flags are unset,
 and a separate programmer auth callback table registered by `FUN_0031117C`
-(`0x14811620`, `0x14811658/60/68`). The loader-table patch candidate
-(`segment1_loader_table.bin`, SHA-256 `f488ee50…3148`) remains unvalidated.
-These firmware-specific conclusions were not independently fact-checked
-without the firmware artifacts.
+(`0x14811620`, `0x14811658/60/68`). The loader-table candidates are:
+v1 `f488ee50…3148` (wrong call target), v2 `2e7a9b2c…24b2d` (UDF constants),
+v3 `cc8f186c…8cb40b` (valid instructions, untested). These firmware-specific
+conclusions were not independently fact-checked without the firmware
+artifacts.
 
 The historical C.01 boot-chain notes report no runtime
 `Is_VERIFIED_BOOT_2()` / GPT `vbmeta` lookup, continuing VB2 and Keymaster

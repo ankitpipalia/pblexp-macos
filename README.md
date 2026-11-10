@@ -12,7 +12,9 @@ execution ping. It does **not** write partitions, GPT, RPMB, or `devinfo`.
 serve sequence is **validated on hardware**, and a direct TX oracle proves
 the `0x970` CVE payload executes. The PBL auth bypass, modified programmer,
 and bootloader unlock are **not** validated. See
-[docs/FINDINGS.md](docs/FINDINGS.md) for the exact working/non-working matrix.
+[docs/FINDINGS.md](docs/FINDINGS.md) for the exact working/non-working matrix;
+[docs/EVIDENCE.md](docs/EVIDENCE.md) records hashes, experiment IDs and the
+oracle packet.
 
 ### Working / not working (2026-11-10)
 

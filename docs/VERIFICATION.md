@@ -129,8 +129,9 @@ recovery from that state still needs a physical power-on.
 This validates the macOS host sequence, loader handoff, serve path, and
 Firehose transport end-to-end. It does **not** validate the auth-bypass
 payload or a modified programmer. The signed programmer is the control:
-a normal loader accepts it without the exploit patch. The loader-table
-candidate and `devprg_710_mod.bin` remain untested.
+a normal loader accepts it without the exploit patch. The modified-programmer
+and loader-table results are recorded in [EVIDENCE.md](EVIDENCE.md); the
+corrected v3 table payload is not yet tested.
 
 ## Payload execution proof (live, 2026-11-10)
 
