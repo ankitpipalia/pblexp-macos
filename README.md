@@ -14,6 +14,22 @@ the `0x970` CVE payload executes. The PBL auth bypass, modified programmer,
 and bootloader unlock are **not** validated. See
 [docs/FINDINGS.md](docs/FINDINGS.md) for the exact working/non-working matrix.
 
+### Working / not working (2026-11-10)
+
+| Area | Status |
+|---|---|
+| macOS 9008 enumeration, claim, bulk transport | working |
+| Native host sequence through segment3 | working |
+| Loader handoff + signed OEM programmer serve | working (181 READ_DATA64, DONE) |
+| Firehose configure and `<power value="reset_to_edl"/>` | working while a programmer runs |
+| Direct proof that the segment1 `0x970` payload executes | working (TX oracle after segment2/3) |
+| PBL programmer-auth bypass / modified programmer | **not working yet** |
+| Bootloader unlock, partition/GPT/RPMB write | **not attempted / not achieved** |
+
+The signed programmer is a control, not an auth bypass. The modified
+programmer is still rejected after the full image is served. Details and
+live logs are in [docs/FINDINGS.md](docs/FINDINGS.md).
+
 ---
 
 ## Why a separate macOS transport
