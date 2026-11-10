@@ -65,22 +65,41 @@ conventions rather than preserving the endpoint descriptor; treat the
 number as unverified until a sanitized descriptor is attached. Runtime USB
 buffer sizing uses the actual endpoint descriptor.
 
-A native macOS host sequence now completes through segment3 after the
-initial-HELLO drain fix. A complete host/serve run remains **unvalidated**:
-the loader reopen succeeds but no READ_DATA arrives after LOADER_HELLO. The
-historical first 48-byte Hello710 bulk OUT timeout was caused by the
-unsolicited initial HELLO not being drained on the libusb path; it is no
-longer reproduced on a cold EDL. These
-observations do not establish whether stale Sahara state, host transport,
-or other behavior caused the failure. Descriptor `iProduct` reads returned
-EIO while the device stayed enumerated; that does not establish that those
-reads caused the later state. The 8-byte receive-buffer defect and aligned
-OUT ZLP defect do not explain that first 48-byte write timeout.
+A native macOS host sequence completes through segment3 after the
+initial-HELLO drain fix. The complete host/serve run is now **validated on
+hardware** with the signed OEM `devprg_710`:
+
+```text
+host: initial RX 0x30 B HELLO drained; Hello710; header; phdrs; segment1;
+      zero END_IMAGE_TX image=0xd status=0x8; 175 reset HELLOs; segment2+3
+handoff: USB bus=1 address=2 ports=(1,)
+serve: initial loader HELLO drained before LOADER_HELLO; 181 READ_DATA64
+       requests; 0xa850c bytes served; END_IMAGE_TX image=0xd status=0x0;
+       DONE_RESP status=1
+Firehose: configure response observed (programmer build 2019-03-04);
+          power reset returned ACK
+```
+
+The serve half needed the same unsolicited-HELLO drain as the host half.
+The Windows COM open consumes that packet; the libusb path must drain it
+before writing LOADER_HELLO, or the loader never issues READ_DATA. The
+historical first 48-byte Hello710 bulk OUT timeout had the same cause.
+
+The signed-programmer run proves the native macOS host, loader handoff, and
+Firehose programmer path. It does **not** prove the PBL auth bypass: a
+normal, signed programmer loads without the exploit patch. The modified
+programmer and loader-table candidate remain untested.
+
+Descriptor `iProduct` reads returned EIO while the device stayed enumerated;
+that does not establish that those reads caused the later state. The 8-byte
+receive-buffer defect and aligned OUT ZLP defect do not explain the first
+48-byte write timeout.
 
 Re-enumeration and handle replacement across Sahara / loader / Firehose are
-implemented for offline testing but remain unvalidated on this hardware.
-The original descriptor research and its historical commands are preserved
-in [MACOS-USB-TRANSPORT.md](MACOS-USB-TRANSPORT.md).
+now exercised live through the signed-programmer run. Recovery after a
+programmer power reset still needs a physical power-on on this unit. The
+original descriptor research and its historical commands are preserved in
+[MACOS-USB-TRANSPORT.md](MACOS-USB-TRANSPORT.md).
 
 ## Separate auth and unlock research
 

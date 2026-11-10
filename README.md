@@ -8,8 +8,9 @@ sends a fixed Sahara image-transfer sequence, serves an OEM programmer image
 from the host, and can optionally send one benign Firehose `<configure>` as an
 execution ping. It does **not** write partitions, GPT, RPMB, or `devinfo`.
 
-**Live status:** native macOS USB enumeration/claim works; the full live
-host/serve sequence is **not yet validated**. See
+**Live status:** the native macOS host, loader handoff, and signed-programmer
+serve sequence is **validated on hardware**. The PBL auth bypass, modified
+programmer, and bootloader unlock are **not** validated. See
 [docs/FINDINGS.md](docs/FINDINGS.md) for the exact working/non-working matrix.
 
 ---

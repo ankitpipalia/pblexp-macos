@@ -95,3 +95,39 @@ address but sent LOADER_HELLO and received no Sahara packet
 (`READ_DATA requests: 0`, read timeout). The loader-state transition remains
 open. The initial-drain change is the reason the first Hello710 OUT no longer
 times out; it was not part of the reviewed commit.
+
+
+## End-to-end signed-programmer validation (live, 2026-11-10)
+
+After adding the same unsolicited-HELLO drain to the loader-serve half, a
+cold EDL run completed the full native sequence:
+
+```text
+host:
+  initial RX 0x30 B HELLO drained: 0100000030000000
+  TX hello710 / elf_header / program_headers / segment1 -> READ_DATA64
+  RX zero END_IMAGE_TX image=0xd status=0x8
+  175 reset HELLOs
+  segment2 + segment3
+  handoff -> USB bus=1 address=2 ports=(1,)
+
+serve:
+  initial loader RX 0x30 B HELLO drained before LOADER_HELLO
+  READ_DATA requests: 181; bytes served: 0xa850c
+  RX END_IMAGE_TX image=0xd status=0x0
+  RX DONE_RESP: complete (status 1)
+  RESULT: Sahara complete
+```
+
+The served image was the signed OEM `devprg_710` (SHA-256
+`a9fc1744...6f214`). A subsequent Firehose read returned the programmer's
+build banner (2019-03-04) and its supported-function list, and
+`<power value="reset"/>` returned `<response value="ACK" .../>`. The device
+then powered down/off; no Android or fastboot enumeration followed, so
+recovery from that state still needs a physical power-on.
+
+This validates the macOS host sequence, loader handoff, serve path, and
+Firehose transport end-to-end. It does **not** validate the auth-bypass
+payload or a modified programmer. The signed programmer is the control:
+a normal loader accepts it without the exploit patch. The loader-table
+candidate and `devprg_710_mod.bin` remain untested.

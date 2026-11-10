@@ -810,6 +810,14 @@ def run_serve(args: argparse.Namespace, image_path: str,
         while time.monotonic() < deadline and not result.done_resp and not rejected:
             try:
                 if need_hello:
+                    # The libusb path can see the PBL/loader's unsolicited
+                    # HELLO on the new handle, just like the host phase.  The
+                    # Windows COM open consumed it.  Drain it before sending
+                    # LOADER_HELLO so the minimal USB stack is ready for OUT.
+                    pre = port.drain(getattr(args, "serve_drain", 0.5))
+                    if pre:
+                        log(f"initial loader RX {len(pre):#x} B "
+                            f"(drained before LOADER_HELLO): {pre[:8].hex()}")
                     port.write(LOADER_HELLO)
                     need_hello = False
                 chunk = port.read(0x10000)
@@ -1119,6 +1127,8 @@ def add_common(p: argparse.ArgumentParser) -> None:
                    help="delay after segment3 before handoff/serve")
     p.add_argument("--serve-settle", type=nonnegative_seconds, default=0.5,
                    help="settle delay after the loader-port open before HELLO")
+    p.add_argument("--serve-drain", type=nonnegative_seconds, default=0.5,
+                   help="drain an unsolicited loader HELLO before LOADER_HELLO")
     p.add_argument("--zero-len", type=lambda s: int(s, 0), default=ZERO_PBLEXP,
                    choices=ZERO_CHOICES)
     p.add_argument("--reset-count", type=bounded_count, default=175)
