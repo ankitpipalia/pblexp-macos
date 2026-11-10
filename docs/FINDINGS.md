@@ -177,6 +177,20 @@ effectively unsigned in this path.  The inner XBL_SEC is QTI-signed; the
 double fix satisfies its hash table but not its signature, and whether its
 verifier runs is unknown.  Neither candidate has been tested on hardware.
 
+Recomputing both tables from the bytes gives a clean 2x2 (outer entry 21 vs
+the outer segment hash; inner entry [5] vs the inner phdr[5] hash):
+
+| Image | Outer table | Inner table |
+|---|---|---|
+| signed `devprg_710` | OK | OK |
+| `devprg_710_mod.bin` (DRM byte only) | stale | stale |
+| `devprg_710_mod_hashfix.bin` | OK | stale |
+| `devprg_710_mod_hashfix2.bin` | OK | OK |
+
+The pristine image verifying on both tables is a positive control for the
+digest model.  The one-byte `CRM`->`DRM` edit sits inside inner `phdr[5]`,
+which is inside outer `phdr[21]`, so it broke both tables by itself.
+
 A skip-BC4C candidate was built but is withdrawn: it zeroes
 `0x1480fbb0+0xb8`, a fuse-derived secure-mode bit; that skips `0x31117c`
 secure setup, and if `ctx+0x40` is zero the later `0xe58c` asserts/hangs.
