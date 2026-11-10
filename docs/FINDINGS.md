@@ -129,8 +129,14 @@ The earlier postflags and loader-table payloads contained a stub-call bug:
 they called `0x300b90` instead of the segment-relative `0x85e28b90`
 (the segment is loaded at `0x85e28000`, not `0x300000`).  They were rebuilt
 with a PC-relative `bl #0x84` from `0xb0c` to `0xb90`.  A signed
-`devprg_710` control loads with the corrected postflags and loader-table
-payloads.
+`devprg_710` control loads with the corrected postflags payload.
+
+The first corrected loader-table payload still had a second bug: its
+resident "success stub" stored `0x2ec88ff0` directly as an instruction
+word, which decodes as `UDF`, not `movz/movk/ret`.  A v3 payload writes
+the valid three-word stubs (`5291fe00 72a5d900 d65f03c0` and
+`52875400 72ab53a0 d65f03c0`) and is the first corrected table test.  It
+is not yet tested on hardware.
 
 The modified `devprg_710_mod.bin` (one benign string byte changed) still
 serves all 181 READ_DATA64 requests (`0xa850c` bytes), then the device

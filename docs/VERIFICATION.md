@@ -148,7 +148,13 @@ that it runs after segment2/3.
 
 Corrected postflags and loader-table payloads used a PC-relative
 `bl #0x84` to the segment-relative stub at `0x85e28b90` instead of the
-earlier broken `0x300b90` call.  Signed `devprg_710` loads with both.
-Modified `devprg_710_mod.bin` still serves all 181 READ_DATA64 requests
+earlier broken `0x300b90` call.  Signed `devprg_710` loads with the
+corrected postflags payload.
+
+The first corrected loader-table stub was still malformed: it stored
+`0x2ec88ff0` as a raw instruction word (UDF), not `movz/movk/ret`.  A v3
+payload writes valid instruction words for both success stubs and is the
+first corrected table test; it is not yet tested.  Modified
+`devprg_710_mod.bin` still serves all 181 READ_DATA64 requests
 (`0xa850c` bytes), then resets before END_IMAGE_TX/DONE; auth bypass and
 unlock remain unproven.  A skip-BC4C candidate is built but untested.
