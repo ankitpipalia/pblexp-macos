@@ -144,7 +144,7 @@ entries, in the same order.
 ### 3.2 Extracted resources
 
 All extracted to `work/macos-port/resources/`; machine-readable copy in
-[`resources/RESOURCES-WINDOWS.json`](resources/RESOURCES-WINDOWS.json).
+`resources/RESOURCES-WINDOWS.json`.
 
 | # | Resource name | File offset | Size | SHA-256 | Non-zero bytes |
 |---|---|---|---|---|---|
