@@ -15,8 +15,10 @@ accepted (`END_IMAGE_TX (13,0)`, `DONE status 1`), and the outer-only control
 is accepted too, so only the outer 22-entry hash table gates acceptance.
 Bootloader **unlock is not achieved**; no partition/GPT/RPMB/`devinfo` write
 has been made. See [docs/FINDINGS.md](docs/FINDINGS.md) for the exact
-working/non-working matrix; [docs/EVIDENCE.md](docs/EVIDENCE.md) records
-hashes, experiment IDs and the oracle packet.
+working/non-working matrix, [docs/FIREHOSE-VIP.md](docs/FIREHOSE-VIP.md) for
+the next-layer authorization analysis, and
+[docs/EVIDENCE.md](docs/EVIDENCE.md) for hashes, experiment IDs and the
+oracle packet.
 
 ### Working / not working (2026-11-11)
 
@@ -28,6 +30,7 @@ hashes, experiment IDs and the oracle packet.
 | Firehose configure and `<power value="reset_to_edl"/>` | working via the private `firehose_power.py` while a programmer runs |
 | Direct proof that the segment1 `0x970` payload executes | working (TX oracle after segment2/3) |
 | **PBL programmer-auth bypass / modified programmer** | **working (2026-11-11): hash-fixed image accepted** |
+| Firehose/VIP static audit | done: dispatch table, EL3-gated VIP, range whitelist ([docs/FIREHOSE-VIP.md](docs/FIREHOSE-VIP.md)) |
 | Behavioural patch of the programmer (VIP/unlock checks) | not attempted |
 | Bootloader unlock, partition/GPT/RPMB write | **not attempted / not achieved** |
 

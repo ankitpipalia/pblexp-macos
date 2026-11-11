@@ -199,6 +199,12 @@ The pristine image verifying on both tables is a positive control for the
 digest model.  The one-byte `CRM`->`DRM` edit sits inside inner `phdr[5]`,
 which is inside outer `phdr[21]`, so it broke both tables by itself.
 
+**Next layer: Firehose/VIP.**  The accepted programmer still authorizes
+individual commands.  Its VIP state comes from EL3 (SCM `0x82000119`, one
+`smc #0`); when enabled, only nine commands are allowed and `program` is
+range-whitelisted to 17 ranges that exclude `abl`, `boot` and `devinfo`.  The
+full structure map is in [FIREHOSE-VIP.md](FIREHOSE-VIP.md).
+
 A skip-BC4C candidate was built but is withdrawn: it zeroes
 `0x1480fbb0+0xb8`, a fuse-derived secure-mode bit; that skips `0x31117c`
 secure setup, and if `ctx+0x40` is zero the later `0xe58c` asserts/hangs.
