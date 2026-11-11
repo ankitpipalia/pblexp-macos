@@ -70,8 +70,14 @@ segment containing the modified byte.  The double fix
 then the outer entry 21 at `0x12c8`; the outer-only control
 (`devprg_710_mod_hashfix.bin`) patches only the outer entry.  The outer
 RSA-signature verifier sits behind a dead PKI gate; the inner XBL_SEC QTI
-signature is not re-signed, and whether its verifier runs is unknown.  Both
-images are built and verified offline, not tested on hardware.
+signature is not re-signed.
+
+**Both were accepted on hardware on 2026-11-11.**  Each completed 181
+READ_DATA64, `END_IMAGE_TX (13,0)` and `DONE status 1`, matching the signed
+control; the unpatched `devprg_710_mod.bin` did not.  Because the outer-only
+control leaves inner entry [5] stale and was still accepted, the inner table
+is not enforced in this path.  No write was made and the device stayed
+`flash.locked=1`; this is an auth bypass, not an unlock.
 
 ---
 

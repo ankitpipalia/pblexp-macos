@@ -162,9 +162,17 @@ writes valid instruction words, but the table it patches
 (`0x14811620/58/60/68`) has zero references in the PBL and is all-zero in
 live IMEM, so v3–v6 are inert.  Modified `devprg_710_mod.bin` still serves
 all 181 READ_DATA64 requests (`0xa850c` bytes), then resets before
-END_IMAGE_TX/DONE; auth bypass and unlock remain unproven.  skip-BC4C is
-withdrawn as hazardous.  The current candidate is a host-side double fix of
-the programmer's nested hash tables: the outer 22-entry table (entry 21 at
-file `0x12c8`) and the embedded XBL_SEC's 6-entry table (entry [5] at file
-`0x971d4`).  The outer-only file is the control.  Both are offline-verified
-only, not tested on hardware.
+END_IMAGE_TX/DONE — with its stale hash table, the unpatched image is
+rejected.  skip-BC4C is
+withdrawn as hazardous.
+
+**2026-11-11 hardware result.**  The host-side hash-table fix works.  Both the
+double fix (`devprg_710_mod_hashfix2.bin`) and the outer-only control
+(`devprg_710_mod_hashfix.bin`) were accepted by the device: 181 READ_DATA64,
+`END_IMAGE_TX (13,0)`, `DONE status 1` — identical to the signed control.
+The unpatched image still fails (reset before END/DONE).  The outer-only
+acceptance proves the embedded XBL_SEC's inner table is not enforced in this
+path, so the outer 22-entry table (entry 21 at file `0x12c8`) is the only hash
+gate.  This is a programmer-auth bypass, not an unlock: no write was made and
+`flash.locked` stayed `1`.  Logs: `work/evidence-2026-11-11/` in the private
+research tree.

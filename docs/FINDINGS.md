@@ -173,9 +173,17 @@ Two host-side candidates are built and verified offline:
 
 Both use the stock segment1.  The outer table is not self-checked and the
 outer RSA-signature verifier sits behind a dead PKI gate, so the outer hash is
-effectively unsigned in this path.  The inner XBL_SEC is QTI-signed; the
-double fix satisfies its hash table but not its signature, and whether its
-verifier runs is unknown.  Neither candidate has been tested on hardware.
+effectively unsigned in this path.
+
+**Hardware result (2026-11-11): both candidates were accepted.**  Each run
+completed 181 READ_DATA64, `END_IMAGE_TX (13,0)` and `DONE status 1`, the same
+success signature as the signed control.  The unpatched image never reached
+it.  Because the outer-only control leaves inner entry [5] stale and was still
+accepted, the inner QTI-signed XBL_SEC table is **not enforced** before the
+programmer runs; only the outer 22-entry table gates acceptance.  The outer
+signature staying stale is likewise not checked.  This is the programmer-auth
+bypass, not a bootloader unlock: no write was made and the device stayed
+`flash.locked=1`.
 
 Recomputing both tables from the bytes gives a clean 2x2 (outer entry 21 vs
 the outer segment hash; inner entry [5] vs the inner phdr[5] hash):

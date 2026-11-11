@@ -8,15 +8,17 @@ sends a fixed Sahara image-transfer sequence, serves an OEM programmer image
 from the host, and can optionally send one benign Firehose `<configure>` as an
 execution ping. It does **not** write partitions, GPT, RPMB, or `devinfo`.
 
-**Live status:** the native macOS host, loader handoff, and signed-programmer
-serve sequence is **validated on hardware**, and a direct TX oracle proves
-the `0x970` CVE payload executes. The PBL auth bypass, modified programmer,
-and bootloader unlock are **not** validated. See
-[docs/FINDINGS.md](docs/FINDINGS.md) for the exact working/non-working matrix;
-[docs/EVIDENCE.md](docs/EVIDENCE.md) records hashes, experiment IDs and the
-oracle packet.
+**Live status (2026-11-11):** the native macOS host, loader handoff,
+signed-programmer serve, and the **PBL programmer-auth bypass** are
+**validated on hardware**. A hash-table-patched modified programmer is
+accepted (`END_IMAGE_TX (13,0)`, `DONE status 1`), and the outer-only control
+is accepted too, so only the outer 22-entry hash table gates acceptance.
+Bootloader **unlock is not achieved**; no partition/GPT/RPMB/`devinfo` write
+has been made. See [docs/FINDINGS.md](docs/FINDINGS.md) for the exact
+working/non-working matrix; [docs/EVIDENCE.md](docs/EVIDENCE.md) records
+hashes, experiment IDs and the oracle packet.
 
-### Working / not working (2026-11-10)
+### Working / not working (2026-11-11)
 
 | Area | Status |
 |---|---|
@@ -25,11 +27,14 @@ oracle packet.
 | Loader handoff + signed OEM programmer serve | working (181 READ_DATA64, DONE) |
 | Firehose configure and `<power value="reset_to_edl"/>` | working via the private `firehose_power.py` while a programmer runs |
 | Direct proof that the segment1 `0x970` payload executes | working (TX oracle after segment2/3) |
-| PBL programmer-auth bypass / modified programmer | **not working yet** |
+| **PBL programmer-auth bypass / modified programmer** | **working (2026-11-11): hash-fixed image accepted** |
+| Behavioural patch of the programmer (VIP/unlock checks) | not attempted |
 | Bootloader unlock, partition/GPT/RPMB write | **not attempted / not achieved** |
 
-The signed programmer is a control, not an auth bypass. The modified
-programmer is still rejected after the full image is served. Details and
+The signed programmer is a control. The hash-fixed modified programmer is
+accepted because the outer SHA-256 table can be recomputed host-side; the
+outer signature verifier sits behind a dead PKI gate and the nested XBL_SEC
+table is not enforced. That is an auth bypass, not an unlock. Details and
 live logs are in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ---
