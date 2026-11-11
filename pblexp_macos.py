@@ -630,7 +630,8 @@ def print_steps(steps: Sequence[HostStep]) -> None:
 
 
 def send_steps(port: ByteTransport, steps: Sequence[HostStep],
-               read_timeout: float = 3.0, strict: bool = True) -> None:
+               read_timeout: float = 3.0, strict: bool = True,
+               fast_resets: bool = False) -> None:
     def mismatch(message):
         if strict:
             raise RuntimeError(message)
@@ -645,6 +646,22 @@ def send_steps(port: ByteTransport, steps: Sequence[HostStep],
         if pre:
             log(f"initial RX {len(pre):#x} B (drained before Hello710): {pre[:8].hex()}")
     for step in steps:
+        if fast_resets and step.name == "reset_state_machine" and step.repeat > 1:
+            # Send the whole reset burst before reading.  A per-reset
+            # round-trip costs ~0.2 s, which can exceed a boot-looping
+            # device's EDL window; a burst keeps the sequence short.
+            port.write(step.data * step.repeat)
+            for index in range(step.repeat):
+                raw = read_variable_packet(port, read_timeout)
+                cmd, length = parse_packet_header(raw)
+                expected_length = PACKET_LENGTHS.get(cmd)
+                if expected_length is None or length != expected_length:
+                    raise ValueError(f"invalid {SAHARA_NAMES.get(cmd, hex(cmd))} length {length:#x}")
+                if cmd != 0x01:
+                    mismatch(f"reset {index + 1}: expected HELLO, got {cmd:#x}")
+                if (index + 1) % 25 == 0 or index + 1 == step.repeat:
+                    log(f"reset {index + 1}/{step.repeat}")
+            continue
         for index in range(step.repeat):
             port.write(step.data)
             if not step.read_len:
@@ -685,7 +702,8 @@ def run_host(args: argparse.Namespace, res: Resources) -> int:
         return 0
     port = open_transport(args)
     try:
-        send_steps(port, steps, args.read_timeout, not args.relaxed)
+        send_steps(port, steps, args.read_timeout, not args.relaxed,
+                       getattr(args, "fast_resets", False))
     finally:
         port.close()
     log("host mode done; no programmer was uploaded")
@@ -932,7 +950,8 @@ def run_all(args: argparse.Namespace, res: Resources, image_path: str) -> int:
         return 0
     port = open_transport(args)
     try:
-        send_steps(port, steps, args.read_timeout, not args.relaxed)
+        send_steps(port, steps, args.read_timeout, not args.relaxed,
+                       getattr(args, "fast_resets", False))
     finally:
         port.close()
     log(f"handoff: waiting {args.handoff_delay:.2f}s")
@@ -1142,6 +1161,9 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--image", default=None,
                    help="programmer image path (serve/all)")
     p.add_argument("--xml", choices=["ufs", "emmc", "none"], default="ufs")
+    p.add_argument("--fast-resets", action="store_true",
+                   help="send the 0x13 reset burst in one write (faster; for "
+                        "devices whose EDL window is short)")
     p.add_argument("--no-hello", action="store_true",
                    help="serve: skip unsolicited initial HELLO_RESP; still answer device HELLO")
     p.add_argument("--total-timeout", type=positive_seconds, default=90.0)

@@ -68,6 +68,19 @@ The image contains `VIP is enabled, receiving the signed table of size %d`,
 contain OPPO's `EnableVip`, `sha256init` or `getsigndata`, which appear in
 OPPO-specific VIP implementations. This is the stock Qualcomm mechanism.
 
+## Live result (2026-11-11): VIP is off on this device
+
+A dispatcher probe sent `erase` expecting a VIP refusal. The programmer
+executed it (`Erasing the whole disk/LUN 0`, `UFS Format whole LUN`, ACK) and
+formatted LUN 0. Recovery writes then succeeded without any digest table.
+Conclusion: EL3 reports VIP off for this device/state, and the programmer
+performs unrestricted writes. The static VIP code above is real but inactive
+here. (The erase was an operational mistake and cost a full LUN 0 restore;
+the device was recovered from the C.01 OTA and its own state dumps.)
+
+So on this device the remaining barrier to a modified boot chain is not
+Firehose policy but **AVB and the locked bootloader**.
+
 ## What this implies
 
 There are three separate barriers, and the hash-table bypass only clears the

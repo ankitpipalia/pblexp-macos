@@ -166,6 +166,13 @@ END_IMAGE_TX/DONE — with its stale hash table, the unpatched image is
 rejected.  skip-BC4C is
 withdrawn as hazardous.
 
+**2026-11-11 recovery note.** During the VIP probe an `erase` command was
+executed by the programmer (VIP turned out to be off) and formatted LUN 0.
+The device was restored to C.01 from the OTA `system` image plus its own C.01
+state dumps, with userdata formatted in recovery; it boots, adb works, and
+`ro.boot.flash.locked` is still `1` / `verifiedbootstate` `green`. See
+`docs/FIREHOSE-VIP.md`.
+
 **2026-11-11 hardware result.**  The host-side hash-table fix works.  Both the
 double fix (`devprg_710_mod_hashfix2.bin`) and the outer-only control
 (`devprg_710_mod_hashfix.bin`) were accepted by the device: 181 READ_DATA64,
