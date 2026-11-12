@@ -180,6 +180,14 @@ docs/WINDOWS-PBLEXP-RE.md       static RE of the Windows OPPOQcomPatchTool
 
 ---
 
+## Companion research record
+
+The surrounding research — 22 workstreams covering CVE-2020-0041 runtime
+root, CVE-2024-31317, Realme Deep Testing, XBL/ABL authentication, the OPPO
+K3 cross-flash, recovery, and the negative results — is in
+[ankitpipalia/rmx1901-research](https://github.com/ankitpipalia/rmx1901-research).
+That repository is the research record; this one is the macOS tooling.
+
 ## Safety
 
 - No partition, GPT, RPMB, or `devinfo` writes are implemented.
